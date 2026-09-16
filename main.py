@@ -38,7 +38,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # ============================================================
 
 APP_NAME = "AGN021G"
-APP_VERSION = "14.2.0"
+APP_VERSION = "14.2.1"
 
 # برند و پشتیبانی AGN021G
 SUPPORT_USERNAME = "AGN021G"
@@ -6771,16 +6771,16 @@ try:
 except Exception as exc:
     logger.exception("VLESS relay module unavailable: %s", exc)
 
-# Diagnostic: plain HTTP on /ws path (proves route is public)
-@app.get("/ws/{uuid}")
-async def ws_http_probe(uuid: str):
+# Diagnostic (HTTP only — must NOT share path with WebSocket /ws/{uuid})
+@app.get("/api/public/tunnel-check")
+async def tunnel_check():
+    has_ws = any(getattr(r, "path", None) == "/ws/{uuid}" for r in app.routes)
     return {
         "ok": True,
         "service": APP_NAME,
         "version": APP_VERSION,
-        "hint": "Use WebSocket upgrade on this path for VLESS",
-        "uuid": uuid,
-        "link_known": uuid in LINKS or any((k or "").replace("-", "") == (uuid or "").replace("-", "") for k in LINKS),
+        "websocket_route": has_ws,
+        "hint": "VLESS path is wss://HOST/ws/<uuid>",
     }
 
 
