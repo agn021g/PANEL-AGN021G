@@ -39,7 +39,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # ============================================================
 
 APP_NAME = "AGN021G"
-APP_VERSION = "14.2.2"
+APP_VERSION = "14.2.3"
 
 # برند و پشتیبانی AGN021G
 SUPPORT_USERNAME = "AGN021G"
@@ -161,7 +161,7 @@ app.add_middleware(
 
 def _is_public_path(path: str) -> bool:
     """Paths reachable without secret PANEL_PATH (subs, health, tunnels, public pages)."""
-    if path in ("/health", "/sub-all", "/"):
+    if path in ("/health", "/sub-all"):
         return True
     public_prefixes = (
         "/sub/",
@@ -214,13 +214,14 @@ async def panel_secret_path_middleware(request: Request, call_next):
         request.state.panel_path = PANEL_PATH
         return await call_next(request)
 
-    # Classic paths without secret → hide panel
+    # دامنه اصلی و مسیرهای بدون پیشوند مخفی → 404 (پنل پنهان)
     return HTMLResponse(
         "<!DOCTYPE html><html><head><meta charset=utf-8><title>404</title></head>"
-        "<body style='font-family:sans-serif;background:#0a0a0f;color:#94a3b8;"
+        "<body style='margin:0;background:#0a0a0f;color:#64748b;font-family:system-ui,sans-serif;"
         "display:flex;min-height:100vh;align-items:center;justify-content:center'>"
-        "<p>404 — Not Found</p></body></html>",
+        "<p style='opacity:.7'>404 — Not Found</p></body></html>",
         status_code=404,
+        headers={"Cache-Control": "no-store"},
     )
 
 
