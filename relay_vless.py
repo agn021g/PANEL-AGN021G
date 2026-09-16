@@ -8,22 +8,20 @@ from datetime import datetime
 
 from fastapi import WebSocket, WebSocketDisconnect
 
-from main import (
-    LINKS,
-    LINKS_LOCK,
-    stats,
-    hourly_traffic,
-    connections,
-    error_logs,
-    logger,
-    is_link_allowed,
-    is_link_expired,
-    is_ip_allowed,
-    save_state,
-    log_activity,
-    now_ir,
-)
-from speed_limit import throttle
+import logging
+
+logger = logging.getLogger("AGN021G.relay")
+
+def _M():
+    """Lazy import main to avoid circular import at startup."""
+    import main as m
+    return m
+
+try:
+    from speed_limit import throttle
+except Exception:
+    async def throttle(uuid, n):  # type: ignore
+        return None
 
 # ══════════════════════════════════════════════════════════════════════════════
 # VLESS Relay — بهینه‌شده برای حداکثر throughput
@@ -82,10 +80,10 @@ _traffic_since_save = 0
 async def check_and_use(uid: str, n: int) -> bool:
     """Account traffic and enforce per-link + group quota. Returns False → must disconnect."""
     global _traffic_dirty, _traffic_since_save
-    from main import sub_used_bytes, sub_limit_bytes, SUBS, save_state
+    m = _M(); sub_used_bytes, sub_limit_bytes, SUBS, save_state = m.sub_used_bytes, m.sub_limit_bytes, m.SUBS, m.save_state
 
-    async with LINKS_LOCK:
-        link = LINKS.get(uid)
+    async with _M().LINKS_LOCK:
+        link = _M().LINKS.get(uid)
         if link is None:
             return False
         if not link.get("active", True):
@@ -109,9 +107,9 @@ async def check_and_use(uid: str, n: int) -> bool:
                 if g_used + n > g_limit:
                     return False
         link["used_bytes"] = used + n
-        stats["total_bytes"] += n
+        _M().stats["total_bytes"] += n
         try:
-            hourly_traffic[now_ir().strftime("%H:00")] += n
+            _M().hourly_traffic[_M().now_ir().strftime("%H:00")] += n
         except Exception:
             pass
         _traffic_dirty = True
@@ -121,7 +119,7 @@ async def check_and_use(uid: str, n: int) -> bool:
             _traffic_since_save = 0
     if should_save:
         try:
-            await save_state()
+            await _M().save_state()
         except Exception:
             pass
     return True
@@ -168,8 +166,8 @@ async def relay_ws_to_tcp(ws: WebSocket, writer: asyncio.StreamWriter, conn_id: 
                 await ws.close(code=1008, reason="quota/disabled/unknown")
                 break
             await throttle(uid, len(data))
-            stats["total_requests"] += 1
-            connections[conn_id]["bytes"] += len(data)
+            _M().stats["total_requests"] += 1
+            _M().connections[conn_id]["bytes"] += len(data)
             writer.write(data)
             if writer.transport.get_write_buffer_size() > RELAY_BUF:
                 await writer.drain()
@@ -195,7 +193,7 @@ async def relay_tcp_to_ws(ws: WebSocket, reader: asyncio.StreamReader, conn_id: 
                 await ws.close(code=1008, reason="quota/disabled/unknown")
                 break
             await throttle(uid, len(data))
-            connections[conn_id]["bytes"] += len(data)
+            _M().connections[conn_id]["bytes"] += len(data)
             payload = (b"\x00\x00" + data) if first else data
             first = False
             await ws.send_bytes(payload)
@@ -211,7 +209,7 @@ async def open_dual_stack(address: str, port: int, timeout: float = 12.0):
 
     prefer_v6 = True
     try:
-        from main import NETWORK_CFG
+        NETWORK_CFG = _M().NETWORK_CFG
         prefer_v6 = bool(NETWORK_CFG.get("prefer_ipv6", True))
     except Exception:
         pass
@@ -257,12 +255,12 @@ async def open_dual_stack(address: str, port: int, timeout: float = 12.0):
 
 def _resolve_link(uuid: str):
     """Find link by uuid (exact or without dashes)."""
-    link = LINKS.get(uuid)
+    link = _M().LINKS.get(uuid)
     if link is not None:
         return uuid, link
     compact = (uuid or "").replace("-", "")
     if compact and compact != uuid:
-        for k, v in LINKS.items():
+        for k, v in _M().LINKS.items():
             if (k or "").replace("-", "") == compact:
                 return k, v
     return uuid, None
@@ -271,15 +269,15 @@ def _resolve_link(uuid: str):
 async def websocket_tunnel(ws: WebSocket, uuid: str):
     await ws.accept()
 
-    async with LINKS_LOCK:
+    async with _M().LINKS_LOCK:
         uuid, link = _resolve_link(uuid)
 
     if link is None:
-        logger.warning(f"🚫 WS unknown uuid={uuid[:12]}… links={len(LINKS)}")
+        logger.warning(f"🚫 WS unknown uuid={uuid[:12]}… links={len(_M().LINKS)}")
         await ws.close(code=1008, reason="unknown uuid")
         return
 
-    if not is_link_allowed(link):
+    if not _M().is_link_allowed(link):
         logger.warning(f"🚫 WS rejected uuid={uuid[:8]}… (not allowed active={link.get('active')} expired?)")
         await ws.close(code=1008, reason="not authorized")
         return
@@ -288,7 +286,7 @@ async def websocket_tunnel(ws: WebSocket, uuid: str):
     try:
         cl = int(link.get("connection_limit") or 0)
         if cl > 0:
-            cur = sum(1 for c in connections.values() if c.get("uuid") == uuid)
+            cur = sum(1 for c in _M().connections.values() if c.get("uuid") == uuid)
             if cur >= cl:
                 logger.warning(f"🚫 WS conn-limit uuid={uuid[:8]} cur={cur}/{cl}")
                 await ws.close(code=1008, reason="connection limit")
@@ -298,9 +296,9 @@ async def websocket_tunnel(ws: WebSocket, uuid: str):
 
     ip = _ws_client_ip(ws)
 
-    if not is_ip_allowed(link, uuid, ip):
+    if not _M().is_ip_allowed(link, uuid, ip):
         logger.warning(f"🚫 WS rejected uuid={uuid[:8]}… ip={ip} (ip limit reached)")
-        log_activity(
+        _M().log_activity(
             "connection",
             f"اتصال {ip} به کانفیگ «{link.get('label', '?')}» رد شد (محدودیت تعداد آی‌پی)",
             "warn",
@@ -309,15 +307,15 @@ async def websocket_tunnel(ws: WebSocket, uuid: str):
         return
 
     conn_id = secrets.token_urlsafe(6)
-    connections[conn_id] = {
+    _M().connections[conn_id] = {
         "uuid": uuid,
         "ip": ip,
         "transport": "vless-ws",
         "connected_at": datetime.now().isoformat(),
         "bytes": 0,
     }
-    logger.info(f"✅ WS [{conn_id}] uuid={uuid[:8]}… ip={ip} total={len(connections)}")
-    log_activity("connection", f"اتصال جدید از {ip} (کانفیگ {link.get('label', '?')})", "info")
+    logger.info(f"✅ WS [{conn_id}] uuid={uuid[:8]}… ip={ip} total={len(_M().connections)}")
+    _M().log_activity("connection", f"اتصال جدید از {ip} (کانفیگ {link.get('label', '?')})", "info")
     writer = None
 
     try:
@@ -334,8 +332,8 @@ async def websocket_tunnel(ws: WebSocket, uuid: str):
             await ws.close(code=1008, reason="quota/disabled")
             return
 
-        stats["total_requests"] += 1
-        connections[conn_id]["bytes"] += len(first_chunk)
+        _M().stats["total_requests"] += 1
+        _M().connections[conn_id]["bytes"] += len(first_chunk)
         logger.info(f"➡️  [{conn_id}] → {address}:{port}")
 
         reader, writer = await asyncio.wait_for(
@@ -361,16 +359,16 @@ async def websocket_tunnel(ws: WebSocket, uuid: str):
             except asyncio.CancelledError:
                 pass
 
-        asyncio.create_task(save_state())
+        asyncio.create_task(_M().save_state())
 
     except WebSocketDisconnect:
         pass
     except asyncio.TimeoutError:
-        stats["total_errors"] += 1
-        error_logs.append({"error": "connection timeout", "time": datetime.now().isoformat()})
+        _M().stats["total_errors"] += 1
+        _M().error_logs.append({"error": "connection timeout", "time": datetime.now().isoformat()})
     except Exception as exc:
-        stats["total_errors"] += 1
-        error_logs.append({"error": str(exc), "time": datetime.now().isoformat()})
+        _M().stats["total_errors"] += 1
+        _M().error_logs.append({"error": str(exc), "time": datetime.now().isoformat()})
         logger.error(f"WS error [{conn_id}]: {exc}")
     finally:
         if writer:
@@ -379,5 +377,5 @@ async def websocket_tunnel(ws: WebSocket, uuid: str):
                 await writer.wait_closed()
             except Exception:
                 pass
-        connections.pop(conn_id, None)
-        logger.info(f"🔌 WS closed [{conn_id}] total={len(connections)}")
+        _M().connections.pop(conn_id, None)
+        logger.info(f"🔌 WS closed [{conn_id}] total={len(_M().connections)}")

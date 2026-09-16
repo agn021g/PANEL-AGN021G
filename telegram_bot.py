@@ -56,6 +56,11 @@ FORCE_JOIN = {
     "enabled": True,
     "channel": "@AGN021G1388",  # کانال اجباری AGN021G
 }
+# cache: user_id -> (ok: bool, expires_ts: float)
+_MEMBER_CACHE: dict = {}
+_CHANNEL_ID_CACHE: dict = {}  # channel_str -> resolved chat_id
+_MEMBER_CACHE_TTL = 300.0  # 5 دقیقه
+_BOT_CHANNEL_OK: bool | None = None  # آیا ربات به کانال دسترسی دارد؟
 
 PAGE_SIZE = 6
 _client: httpx.AsyncClient | None = None
@@ -127,9 +132,22 @@ def configure_bot(token: str, admin_ids: str):
     global BOT_TOKEN, ADMIN_IDS, API_BASE
     BOT_TOKEN = (token or "").strip()
     raw = (admin_ids or "").strip()
-    ADMIN_IDS = {int(x) for x in raw.replace(" ", "").split(",") if x.isdigit()} if raw else set()
+    ids = set()
+    if raw:
+        for part in raw.replace(";", ",").replace(" ", ",").split(","):
+            part = part.strip()
+            if part.isdigit() or (part.startswith("-") and part[1:].isdigit()):
+                try:
+                    ids.add(int(part))
+                except Exception:
+                    pass
+    ADMIN_IDS = ids
     API_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}" if BOT_TOKEN else ""
     _load_force_join()
+    # پاک کردن کش عضویت بعد از کانفیگ
+    _MEMBER_CACHE.clear()
+    _CHANNEL_ID_CACHE.clear()
+    globals()["_BOT_CHANNEL_OK"] = None
     logger.info(f"{BOT_NAME} configured (admins={len(ADMIN_IDS)}, token={'yes' if BOT_TOKEN else 'no'})")
 
 
@@ -207,50 +225,164 @@ def _is_admin(chat_id: int) -> bool:
     return chat_id in ADMIN_IDS
 
 
-async def _check_membership(user_id: int) -> bool:
-    """True if force-join disabled, user is panel admin, or member of required channel."""
+def _member_cache_get(user_id: int) -> bool | None:
+    import time
+    item = _MEMBER_CACHE.get(int(user_id))
+    if not item:
+        return None
+    ok, exp = item
+    if time.time() > exp:
+        _MEMBER_CACHE.pop(int(user_id), None)
+        return None
+    return bool(ok)
+
+
+def _member_cache_set(user_id: int, ok: bool, ttl: float | None = None):
+    import time
+    _MEMBER_CACHE[int(user_id)] = (bool(ok), time.time() + (ttl if ttl is not None else _MEMBER_CACHE_TTL))
+
+
+def _channel_candidates(raw: str) -> list:
+    """لیست شناسه‌های ممکن کانال برای getChat / getChatMember."""
+    raw = (raw or "").strip()
+    if not raw:
+        return []
+    out = []
+    # numeric id (-100...)
+    if raw.lstrip("-").isdigit():
+        try:
+            out.append(int(raw))
+        except Exception:
+            pass
+        out.append(raw)
+        return out
+    # @username or username
+    name = raw[1:] if raw.startswith("@") else raw
+    name = name.replace("https://t.me/", "").replace("http://t.me/", "").replace("t.me/", "")
+    name = name.strip("/").split("?")[0].split("/")[0]
+    if name:
+        out.append("@" + name)
+        out.append(name)
+    return out
+
+
+async def _resolve_channel_id() -> str | int | None:
+    """شناسه کانال را resolve و کش می‌کند."""
+    global _BOT_CHANNEL_OK
+    ch = (FORCE_JOIN.get("channel") or "").strip()
+    if not ch:
+        return None
+    if ch in _CHANNEL_ID_CACHE:
+        return _CHANNEL_ID_CACHE[ch]
+    for cand in _channel_candidates(ch):
+        res = await _call("getChat", chat_id=cand)
+        if res and res.get("ok"):
+            result = res.get("result") or {}
+            cid = result.get("id")
+            if cid is not None:
+                _CHANNEL_ID_CACHE[ch] = cid
+                _BOT_CHANNEL_OK = True
+                logger.info(f"force_join channel resolved: {ch} -> {cid}")
+                return cid
+        else:
+            desc = str((res or {}).get("description") or "")
+            if desc:
+                logger.warning(f"getChat({cand}) failed: {desc}")
+    # fallback: use first candidate as-is
+    cands = _channel_candidates(ch)
+    return cands[0] if cands else None
+
+
+async def _check_membership(user_id: int, *, force: bool = False) -> bool:
+    """True اگر عضویت اجباری خاموش، ادمین پنل، یا عضو کانال باشد.
+
+    force=True کش را نادیده می‌گیرد (دکمه بررسی مجدد).
+    """
+    global _BOT_CHANNEL_OK
     if not FORCE_JOIN.get("enabled"):
         return True
-    # ادمین‌های پنل همیشه عبور می‌کنند (حتی اگر ربات ادمین کانال نباشد)
     try:
-        if int(user_id) in ADMIN_IDS:
-            return True
+        uid = int(user_id)
     except Exception:
-        pass
+        return False
+    if uid in ADMIN_IDS:
+        return True
+
     ch = (FORCE_JOIN.get("channel") or "").strip()
     if not ch:
         return True
-    # نرمال‌سازی چند حالت: @name / name / -100id
+
+    if not force:
+        cached = _member_cache_get(uid)
+        if cached is not None:
+            return cached
+
+    chat_id = await _resolve_channel_id()
     candidates = []
-    raw = ch
-    if raw.startswith("@"):
-        candidates.append(raw)
-        candidates.append(raw[1:])
-    elif raw.lstrip("-").isdigit():
-        candidates.append(int(raw) if raw.lstrip("-").isdigit() else raw)
-        candidates.append(raw)
-    else:
-        candidates.append("@" + raw)
-        candidates.append(raw)
-    last_err = None
-    for chat_id in candidates:
-        res = await _call("getChatMember", chat_id=chat_id, user_id=int(user_id))
+    if chat_id is not None:
+        candidates.append(chat_id)
+    for c in _channel_candidates(ch):
+        if c not in candidates:
+            candidates.append(c)
+
+    last_err = ""
+    bot_no_access = False
+    for cid in candidates:
+        res = await _call("getChatMember", chat_id=cid, user_id=uid)
         if not res:
             continue
         if res.get("ok"):
-            status = (res.get("result") or {}).get("status", "")
-            # left / kicked = not member
-            if status in ("creator", "administrator", "member", "restricted"):
-                return True
-            return False
-        last_err = res.get("description") or res
-        # اگر ربات ادمین کانال نیست، برای جلوگیری از قفل شدن همه، لاگ کن
+            status = str((res.get("result") or {}).get("status") or "").lower()
+            # member / administrator / creator / restricted = عضو
+            ok = status in ("creator", "administrator", "member", "restricted")
+            _BOT_CHANNEL_OK = True
+            _member_cache_set(uid, ok, ttl=60.0 if not ok else _MEMBER_CACHE_TTL)
+            if not ok:
+                logger.info(f"force_join user={uid} status={status} (not member)")
+            return ok
         desc = str(res.get("description") or "")
-        if "chat not found" in desc.lower() or "bot is not a member" in desc.lower() or "have no rights" in desc.lower():
-            logger.warning(f"force_join getChatMember failed ({chat_id}): {desc}")
+        last_err = desc
+        low = desc.lower()
+        if any(x in low for x in (
+            "bot is not a member",
+            "chat not found",
+            "have no rights",
+            "not enough rights",
+            "bot was kicked",
+            "PEER_ID_INVALID".lower(),
+            "CHAT_ADMIN_REQUIRED".lower(),
+        )):
+            bot_no_access = True
+            logger.warning(f"force_join bot access issue chat={cid}: {desc}")
+
+    if bot_no_access:
+        _BOT_CHANNEL_OK = False
+        # اگر ربات به کانال دسترسی ندارد، همه قفل می‌شوند — برای ادمین قبلاً True شده
+        # برای مشتری: False + پیام راهنما در guard
+        _member_cache_set(uid, False, ttl=30.0)
+        return False
+
     if last_err:
-        logger.warning(f"force_join check failed for user={user_id}: {last_err}")
+        logger.warning(f"force_join check failed user={uid}: {last_err}")
+    _member_cache_set(uid, False, ttl=45.0)
     return False
+
+
+def _force_join_help_text() -> str:
+    ch = (FORCE_JOIN.get("channel") or "").strip() or "—"
+    extra = ""
+    if _BOT_CHANNEL_OK is False:
+        extra = (
+            "\n\n⚠️ <b>توجه ادمین:</b> ربات باید در کانال <b>ادمین</b> باشد "
+            "وگرنه عضویت تشخیص داده نمی‌شود."
+        )
+    return (
+        f"📢 <b>عضویت اجباری</b>\n"
+        f"{'─' * 18}\n"
+        f"برای استفاده از {BOT_NAME} باید در کانال عضو باشید:\n"
+        f"<code>{ch}</code>"
+        f"{extra}"
+    )
 
 
 def _force_join_kb():
@@ -731,17 +863,9 @@ async def _guard(chat_id: int, user_id: int | None = None, admin_only: bool = Fa
         return True
     ok = await _check_membership(uid)
     if not ok:
-        await _send(
-            chat_id,
-            f"📢 <b>عضویت اجباری</b>\n"
-            f"{'─' * 18}\n"
-            f"برای استفاده از {BOT_NAME} باید در کانال عضو باشید:\n"
-            f"<code>{ch}</code>",
-            _force_join_kb(),
-        )
+        await _send(chat_id, _force_join_help_text(), _force_join_kb())
         return False
     return True
-
 
 
 # ── Handlers ─────────────────────────────────────────────────────────────────
@@ -791,6 +915,9 @@ async def _handle_message(msg: dict):
         ch = text.strip()
         if ch:
             FORCE_JOIN["channel"] = ch
+            _CHANNEL_ID_CACHE.clear()
+            _MEMBER_CACHE.clear()
+            globals()["_BOT_CHANNEL_OK"] = None
             _save_force_join()
             _pending.pop(chat_id, None)
             await _send(chat_id, f"✅ کانال عضویت اجباری: <code>{ch}</code>", _settings_kb())
@@ -960,16 +1087,25 @@ async def _handle_callback(cb: dict):
 
     # force-join check button — available even when blocked
     if data == "fj:check":
-        ok = _is_admin(user_id) or _is_admin(chat_id) or await _check_membership(user_id)
+        if _is_admin(user_id) or _is_admin(chat_id):
+            ok = True
+        else:
+            ok = await _check_membership(user_id, force=True)
         if ok:
             await _answer_cb(cb_id, "✅ عضویت تأیید شد")
             await _edit(chat_id, mid, _welcome_text(chat_id), _main_menu_kb(chat_id))
         else:
-            await _answer_cb(
-                cb_id,
-                "هنوز عضو نیستید.\nاگر عضو هستید: ربات را در کانال ادمین کنید.",
-                alert=True,
-            )
+            msg = "هنوز عضو کانال نیستید."
+            if _BOT_CHANNEL_OK is False:
+                msg = (
+                    "ربات به کانال دسترسی ندارد.\n"
+                    "ادمین باید ربات را در کانال ادمین کند."
+                )
+            await _answer_cb(cb_id, msg, alert=True)
+            try:
+                await _edit(chat_id, mid, _force_join_help_text(), _force_join_kb())
+            except Exception:
+                pass
         return
 
     
@@ -1220,15 +1356,14 @@ async def _handle_callback(cb: dict):
         return
 
     # membership for other actions
-    if data not in ("fj:toggle", "fj:set", "settings", "botinfo") and FORCE_JOIN.get("enabled"):
+    if (
+        data not in ("fj:toggle", "fj:set", "fj:check", "settings", "botinfo")
+        and FORCE_JOIN.get("enabled")
+        and not (_is_admin(user_id) or _is_admin(chat_id))
+    ):
         if not await _check_membership(user_id):
-            await _answer_cb(cb_id, "عضویت اجباری", alert=True)
-            await _edit(
-                chat_id,
-                mid,
-                f"📢 عضویت اجباری فعال است.\nکانال: <code>{FORCE_JOIN.get('channel')}</code>",
-                _force_join_kb(),
-            )
+            await _answer_cb(cb_id, "ابتدا در کانال عضو شوید", alert=True)
+            await _edit(chat_id, mid, _force_join_help_text(), _force_join_kb())
             return
 
     await _answer_cb(cb_id)
@@ -1295,6 +1430,9 @@ async def _handle_callback(cb: dict):
 
     if data == "fj:toggle":
         FORCE_JOIN["enabled"] = not bool(FORCE_JOIN.get("enabled"))
+        _MEMBER_CACHE.clear()
+        _CHANNEL_ID_CACHE.clear()
+        globals()["_BOT_CHANNEL_OK"] = None
         _save_force_join()
         await _edit(
             chat_id,

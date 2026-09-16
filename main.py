@@ -38,7 +38,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # ============================================================
 
 APP_NAME = "AGN021G"
-APP_VERSION = "14.1.1"
+APP_VERSION = "14.2.0"
 
 # برند و پشتیبانی AGN021G
 SUPPORT_USERNAME = "AGN021G"
@@ -185,14 +185,21 @@ async def panel_secret_path_middleware(request: Request, call_next):
     Public subscription + tunnel routes stay open.
     Unknown paths without the secret prefix return 404 (no panel leak).
     """
-    # WebSocket upgrades must never be rewritten/blocked by this middleware
+    # WebSocket handshake is HTTP type with Upgrade header — must pass through
     if request.scope.get("type") == "websocket":
+        return await call_next(request)
+    upgrade = (request.headers.get("upgrade") or "").lower()
+    if upgrade == "websocket":
         return await call_next(request)
 
     path = request.scope.get("path") or request.url.path or "/"
     # normalize
     if not path.startswith("/"):
         path = "/" + path
+
+    # tunnels always public (before any other logic)
+    if path.startswith("/ws/") or path.startswith("/xhttp-siz10/"):
+        return await call_next(request)
 
     if _is_public_path(path):
         return await call_next(request)
@@ -1283,7 +1290,6 @@ def generate_vless_link(
             "host": host,
             "path": f"/ws/{uuid}",
             "fp": fp,
-            "packetEncoding": "xudp",
         }
         if sec == "tls":
             q["sni"] = host
@@ -1299,7 +1305,6 @@ def generate_vless_link(
             "host": host,
             "path": f"/xhttp-siz10/{mode}/{uuid}",
             "fp": fp,
-            "packetEncoding": "xudp",
         }
         if sec == "tls":
             q["sni"] = host
@@ -2797,8 +2802,8 @@ button:disabled{opacity:.5;cursor:not-allowed}
   <div id="loginBox" class="hidden">
     <div class="err" id="loginErr"></div>
     <form id="loginForm">
-      <label>نام کاربری ادمین</label>
-      <input type="text" id="loginUser" placeholder="اختیاری" autocomplete="username">
+      <label>نام کاربری (برای مالک خالی بگذارید)</label>
+      <input type="text" id="loginUser" placeholder="خالی = مالک پنل" autocomplete="username">
       <label>رمز عبور</label>
       <input type="password" id="loginPw" placeholder="رمز عبور" autocomplete="current-password" required>
       <button type="submit" id="loginBtn">ورود</button>
@@ -2857,7 +2862,9 @@ document.getElementById('loginForm').addEventListener('submit',async e=>{
     })});
     if(!r.ok){
       const d=await r.json().catch(()=>({}));
-      throw new Error(d.detail||'رمز اشتباه است');
+      let msg=d.detail||'رمز اشتباه است';
+      if(Array.isArray(msg)) msg=msg.map(x=>x.msg||x).join(' ');
+      throw new Error(msg);
     }
     location.href=(window.PANEL_BASE||'')+'/dashboard';
   }catch(e){
@@ -3110,32 +3117,58 @@ async def api_login(request: Request):
         body = await request.json()
     except Exception:
         raise HTTPException(status_code=400, detail="JSON نامعتبر است")
-    password = str(body.get("password", "")).strip()
-    username = str(body.get("username", "")).strip().lower()
+    password = str(body.get("password", "") or "").strip()
+    # یوزرنیم خالی / None / فاصله = ورود مالک
+    username_raw = body.get("username", None)
+    if username_raw is None:
+        username = ""
+    else:
+        username = str(username_raw).strip().lower()
+    # نام‌های رزرو مالک
+    OWNER_NAMES = {"", "owner", "admin", "root", "agn021g", "panel"}
     ip = client_ip(request)
     blocked, retry_after = login_is_blocked(ip)
     if blocked:
-        raise HTTPException(status_code=429, detail=f"ورود موقتاً مسدود است. حدود {max(1, (retry_after + 59) // 60)} دقیقه دیگر تلاش کنید.", headers={"Retry-After": str(retry_after)})
+        raise HTTPException(
+            status_code=429,
+            detail=f"ورود موقتاً مسدود است. حدود {max(1, (retry_after + 59) // 60)} دقیقه دیگر تلاش کنید.",
+            headers={"Retry-After": str(retry_after)},
+        )
     if not password:
         register_login_failure(ip)
         raise HTTPException(status_code=400, detail="رمز عبور الزامی است")
     meta = {"role": "owner", "admin_id": None, "username": "owner"}
     ok = False
-    if username and username not in ("owner", "admin", "root"):
+    if username and username not in OWNER_NAMES:
+        # ادمین فرعی
         aid, admin = find_admin_by_username(username)
-        if admin and admin.get("password_hash") == hash_password(password):
+        if not admin:
+            locked, value = register_login_failure(ip)
+            if locked:
+                raise HTTPException(status_code=429, detail="تعداد تلاش بیش از حد. ۱۵ دقیقه صبر کنید.", headers={"Retry-After": str(LOGIN_LOCKOUT_SECONDS)})
+            raise HTTPException(status_code=401, detail=f"نام کاربری پیدا نشد. {value} تلاش باقی‌مانده")
+        if admin.get("password_hash") == hash_password(password):
             if not admin_is_valid(admin):
                 raise HTTPException(status_code=403, detail="حساب مسدود یا منقضی شده است")
             ok = True
             meta = {"role": "admin", "admin_id": aid, "username": username}
     else:
-        if hash_password(password) == AUTH["password_hash"]:
+        # ورود مالک — یوزرنیم خالی یا admin/owner/root
+        stored = (AUTH.get("password_hash") or "").strip()
+        if stored and hash_password(password) == stored:
             ok = True
+        else:
+            # سازگاری: اگر ADMIN_PASSWORD در env باشد با همان هم چک کن
+            env_pw = (os.environ.get("ADMIN_PASSWORD") or "").strip()
+            if env_pw and password == env_pw:
+                ok = True
+                AUTH["password_hash"] = hash_password(password)
+                AUTH["password_configured"] = True
     if not ok:
         locked, value = register_login_failure(ip)
         if locked:
             raise HTTPException(status_code=429, detail="تعداد تلاش بیش از حد. ۱۵ دقیقه صبر کنید.", headers={"Retry-After": str(LOGIN_LOCKOUT_SECONDS)})
-        raise HTTPException(status_code=401, detail=f"نام کاربری یا رمز اشتباه است. {value} تلاش باقی‌مانده")
+        raise HTTPException(status_code=401, detail=f"رمز عبور اشتباه است. {value} تلاش باقی‌مانده")
     clear_login_failures(ip)
     token = await create_session(meta)
     response = JSONResponse({"ok": True, "role": meta["role"], "username": meta["username"]})
@@ -6731,31 +6764,24 @@ async def get_connections(
 # ============================================================
 
 try:
-
-    from relay_vless import (
-        RELAY_BUF,
-        parse_vless_header,
-        check_and_use,
-        relay_ws_to_tcp,
-        relay_tcp_to_ws,
-        websocket_tunnel,
-    )
-
-    app.add_api_websocket_route(
-        "/ws/{uuid}",
-        websocket_tunnel,
-    )
-
-    logger.info(
-        "VLESS relay loaded."
-    )
-
+    from relay_vless import websocket_tunnel
+    app.add_api_websocket_route("/ws/{uuid}", websocket_tunnel)
+    # also mount without trailing issues
+    logger.info("VLESS relay loaded — WS /ws/{uuid}")
 except Exception as exc:
+    logger.exception("VLESS relay module unavailable: %s", exc)
 
-    logger.warning(
-        "VLESS relay module unavailable: %s",
-        exc,
-    )
+# Diagnostic: plain HTTP on /ws path (proves route is public)
+@app.get("/ws/{uuid}")
+async def ws_http_probe(uuid: str):
+    return {
+        "ok": True,
+        "service": APP_NAME,
+        "version": APP_VERSION,
+        "hint": "Use WebSocket upgrade on this path for VLESS",
+        "uuid": uuid,
+        "link_known": uuid in LINKS or any((k or "").replace("-", "") == (uuid or "").replace("-", "") for k in LINKS),
+    }
 
 
 # ============================================================
