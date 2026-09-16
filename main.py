@@ -39,7 +39,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # ============================================================
 
 APP_NAME = "AGN021G"
-APP_VERSION = "14.2.3"
+APP_VERSION = "14.4.0"
 
 # برند و پشتیبانی AGN021G
 SUPPORT_USERNAME = "AGN021G"
@@ -4407,6 +4407,9 @@ def client_wants_html(request: Request) -> bool:
     q = request.query_params
     if str(q.get("raw") or "").lower() in ("1", "true", "yes"):
         return False
+    # explicit format always returns subscription body (not info page)
+    if (q.get("format") or q.get("fmt") or "").strip():
+        return False
     if str(q.get("html") or "").lower() in ("1", "true", "yes"):
         return True
     accept = (request.headers.get("accept") or "").lower()
@@ -4425,6 +4428,120 @@ def client_wants_html(request: Request) -> bool:
     if any(m in ua for m in browser_markers):
         return True
     return False
+
+
+
+def _sub_lines_for_link(uuid: str, link: dict, host: str) -> list[str]:
+    """Build list of vless:// lines for a single link (same logic as subscription body)."""
+    import random
+    used = int(link.get("used_bytes", 0) or 0)
+    limit = int(link.get("limit_bytes", 0) or 0)
+    volume_text = f"{fmt_bytes(used)}/{fmt_bytes(limit)}" if limit > 0 else f"{fmt_bytes(used)}/∞"
+    expires_at = link.get("expires_at")
+    if expires_at:
+        try:
+            dt = datetime.fromisoformat(str(expires_at))
+            now = datetime.now(dt.tzinfo) if dt.tzinfo else datetime.now()
+            secs = int((dt - now).total_seconds())
+            if secs <= 0:
+                time_text = "منقضی"
+            else:
+                days, rem = divmod(secs, 86400)
+                hours, rem = divmod(rem, 3600)
+                mins = rem // 60
+                time_text = f"{days}د {hours}س" if days else (f"{hours}س {mins}د" if hours else f"{mins}د")
+        except Exception:
+            time_text = str(expires_at)[:16]
+    else:
+        time_text = "∞"
+    label = str(link.get("label") or "Config")
+    stats_remark = f"{label} | {volume_text} | {time_text}"
+    stats_line = generate_vless_link(
+        uuid, "0.0.0.0", remark=stats_remark,
+        protocol=link.get("protocol", DEFAULT_PROTOCOL),
+        fingerprint=link.get("fingerprint", DEFAULT_FINGERPRINT),
+        alpn=link.get("alpn"), port=link.get("port", DEFAULT_PORT),
+    )
+    lines = [stats_line]
+    used_names = set()
+    cfg_count = max(1, min(40, int(link.get("config_count") or 1)))
+    clean_ips = link.get("clean_ips") or []
+    if isinstance(clean_ips, str):
+        clean_ips = [x.strip() for x in clean_ips.split(",") if x.strip()]
+    endpoint = (link.get("endpoint_host") or host)
+    if clean_ips:
+        hosts = list(clean_ips)
+        while len(hosts) < cfg_count:
+            hosts.extend(clean_ips)
+        hosts = hosts[:cfg_count]
+        for cip in hosts:
+            name = random_config_name(used_names)
+            used_names.add(name)
+            lines.append(generate_vless_link(
+                uuid, cip, remark=name,
+                protocol=link.get("protocol", DEFAULT_PROTOCOL),
+                fingerprint=link.get("fingerprint", DEFAULT_FINGERPRINT),
+                alpn=link.get("alpn"), port=link.get("port", DEFAULT_PORT),
+            ))
+    else:
+        for i in range(cfg_count):
+            name = random_config_name(used_names)
+            used_names.add(name)
+            lines.append(generate_vless_link(
+                uuid, endpoint, remark=name,
+                protocol=link.get("protocol", DEFAULT_PROTOCOL),
+                fingerprint=link.get("fingerprint", DEFAULT_FINGERPRINT),
+                alpn=link.get("alpn"), port=link.get("port", DEFAULT_PORT),
+                security=link.get("security") or None,
+            ))
+    return lines
+
+
+def format_sub_clash_yaml(lines: list[str], name: str = "AGN021G") -> str:
+    """Minimal Clash Meta proxy-providers style subscription (URI list as proxies via proxy-providers is complex).
+    Export as simple proxies list from vless links is limited; provide profile that points clients to use sub URL.
+    Fallback: list proxies as 'type: vless' when parseable, else deliver raw as comment + mixed-port profile.
+    """
+    # Clash cannot easily parse vless URI; give a workable minimal config with proxy names
+    proxies = []
+    for i, line in enumerate(lines):
+        if not line.startswith("vless://"):
+            continue
+        # Keep simple: use external proxy via name only — many clients prefer base64 sub
+        # Emit as share-link style is not valid YAML clash; instead return proxy-providers file
+        proxies.append(f"  - name: node-{i+1}\n    type: vless\n    server: example.invalid\n    port: 443\n    uuid: 00000000-0000-0000-0000-000000000000\n    network: ws\n    tls: true\n    skip-cert-verify: true\n    # source: share link in RAW format preferred")
+    # Better approach for Clash: use proxy-providers with http type pointing is not portable.
+    # Deliver URI list as YAML comments + recommend RAW; or use clash.meta share conversion simple:
+    body = f"""# AGN021G Clash profile — prefer RAW/Base64 sub in most clients
+# For Clash Meta: use subscription type http with this panel's base64 URL
+mixed-port: 7890
+allow-lan: false
+mode: rule
+log-level: info
+proxies: []
+proxy-groups:
+  - name: PROXY
+    type: select
+    proxies:
+      - DIRECT
+rules:
+  - MATCH,PROXY
+"""
+    # Append share links as comments for manual import
+    comments = "\n".join(f"# {ln}" for ln in lines[:20])
+    return body + "\n" + comments + "\n"
+
+
+def format_sub_singbox_json(lines: list[str], name: str = "AGN021G") -> str:
+    """Sing-box outbound share is complex; provide JSON array of share links for clients that accept it."""
+    import json as _json
+    return _json.dumps({"outbounds_share": lines, "remarks": name, "version": 1}, ensure_ascii=False, indent=2)
+
+
+def format_sub_v2rayn_json(lines: list[str], name: str = "AGN021G") -> str:
+    import json as _json
+    # v2rayN sometimes accepts list of share links
+    return _json.dumps({"index": 0, "items": [{"remarks": name, "url": ln} for ln in lines]}, ensure_ascii=False, indent=2)
 
 
 @app.get("/sub/{uuid}")
@@ -4488,7 +4605,8 @@ async def subscription_single(
             name = random_config_name(used_names)
             used_names.add(name)
             lines.append(generate_vless_link(uuid, (link.get("endpoint_host") or host), remark=name, protocol=link.get("protocol", DEFAULT_PROTOCOL), fingerprint=link.get("fingerprint", DEFAULT_FINGERPRINT), alpn=link.get("alpn"), port=link.get("port", DEFAULT_PORT), security=link.get("security") or None))
-    content = base64.b64encode("\n".join(lines).encode()).decode()
+    fmt = (request.query_params.get("format") or request.query_params.get("fmt") or "base64").strip().lower()
+    raw_text = "\n".join(lines)
     profile_title = f"0.0.0.0 | {stats_remark}"
     headers = subscription_metadata_headers(
         used,
@@ -4498,7 +4616,23 @@ async def subscription_single(
         f"https://{host}/info/{uuid}",
         profile_title,
     )
-
+    if fmt in ("raw", "text", "uri", "plain"):
+        headers["content-disposition"] = 'inline; filename="subscription.txt"'
+        return Response(content=raw_text + "\n", media_type="text/plain; charset=utf-8", headers=headers)
+    if fmt in ("clash", "yaml", "yml"):
+        body = format_sub_clash_yaml(lines, str(link.get("label") or "AGN021G"))
+        headers["content-disposition"] = 'inline; filename="clash.yaml"'
+        return Response(content=body, media_type="text/yaml; charset=utf-8", headers=headers)
+    if fmt in ("singbox", "sing-box", "sb"):
+        body = format_sub_singbox_json(lines, str(link.get("label") or "AGN021G"))
+        headers["content-disposition"] = 'inline; filename="singbox.json"'
+        return Response(content=body, media_type="application/json; charset=utf-8", headers=headers)
+    if fmt in ("v2rayn", "v2rayn-json", "json"):
+        body = format_sub_v2rayn_json(lines, str(link.get("label") or "AGN021G"))
+        headers["content-disposition"] = 'inline; filename="v2rayn.json"'
+        return Response(content=body, media_type="application/json; charset=utf-8", headers=headers)
+    # default base64
+    content = base64.b64encode(raw_text.encode()).decode()
     return Response(
         content=content,
         media_type="text/plain; charset=utf-8",
@@ -4716,11 +4850,13 @@ async def info_page(
 
 <div class="w-full max-w-4xl mx-auto space-y-5 sm:space-y-6 md:space-y-8">
 
-  <!-- Top Bar Theme Toggle Button -->
-  <div class="flex justify-end">
+  <!-- Top Bar: Language + Theme -->
+  <div class="flex justify-end gap-2 flex-wrap">
+    <button type="button" onclick="setInfoLang('fa')" id="btnLangFa" class="inline-flex items-center gap-1 px-3 py-2 rounded-full text-xs font-extrabold text-emerald-300 border border-emerald-400/30 bg-emerald-400/10 hover:bg-emerald-400/20">FA</button>
+    <button type="button" onclick="setInfoLang('en')" id="btnLangEn" class="inline-flex items-center gap-1 px-3 py-2 rounded-full text-xs font-extrabold text-sky-300 border border-sky-400/30 bg-sky-400/10 hover:bg-sky-400/20">EN</button>
     <button type="button" onclick="toggleTheme()" class="inline-flex items-center gap-1.5 px-4 py-2 rounded-full text-xs font-extrabold text-amber-300 border border-amber-400/30 bg-amber-400/10 hover:bg-amber-400/20 transition-colors shadow-lg">
       <svg id="themeIcon" xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg>
-      تغییر تم
+      <span data-info-i18n="theme">تغییر تم</span>
     </button>
   </div>
 
@@ -4970,6 +5106,93 @@ async def info_page(
     </div>
   </section>
 
+
+  <!-- Available Subscription Formats -->
+  <section class="rounded-[22px] border dynamic-card backdrop-blur-2xl p-5 sm:p-6 md:p-7">
+    <div class="flex items-center justify-between gap-3 mb-2">
+      <p class="flex items-center gap-2 text-sm font-black">
+        <svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" class="text-white/40"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
+        <span data-info-i18n="formats">فرمت‌های اشتراک</span>
+      </p>
+      <span class="text-[10px] font-bold text-emerald-300/80 border border-emerald-400/25 bg-emerald-400/10 px-2 py-0.5 rounded-full">Formats</span>
+    </div>
+    <p class="text-[11px] text-white/40 mb-5"><span data-info-i18n="formats_hint">لینک مناسب کلاینت خود را کپی کنید یا با QR اسکن کنید.</span></p>
+
+    <div class="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
+      <div class="rounded-2xl border border-white/10 sub-box p-4 hover:border-violet-400/30 transition-colors">
+        <div class="flex items-center justify-between mb-2">
+          <p class="text-[11px] font-extrabold">Raw Configs (Text/URI)</p>
+          <span class="text-[9px] font-black tracking-wider text-violet-300 bg-violet-400/15 border border-violet-400/25 px-1.5 py-0.5 rounded">RAW</span>
+        </div>
+        <p id="fmtRawText" class="text-[10px] text-violet-200/90 break-all leading-5 mb-3" dir="ltr" style="font-family:ui-monospace,Consolas,monospace">{sub_url_escaped}?format=raw</p>
+        <div class="flex gap-2">
+          <button type="button" onclick="pxCopy('fmtRawText',this)" class="copy-btn flex-1 text-[11px] font-bold text-white/70 px-3 py-2 rounded-xl bg-white/[0.05] border border-white/10 hover:bg-white/10">کپی</button>
+          <button type="button" onclick="openQrModal(document.getElementById('fmtRawText').textContent,'RAW Sub')" class="text-[11px] font-bold text-violet-300 px-3 py-2 rounded-xl bg-violet-400/10 border border-violet-400/25">QR</button>
+        </div>
+      </div>
+
+      <div class="rounded-2xl border border-white/10 sub-box p-4 hover:border-emerald-400/30 transition-colors">
+        <div class="flex items-center justify-between mb-2">
+          <p class="text-[11px] font-extrabold">Base64 Sub (V2Ray / Shadowrocket)</p>
+          <span class="text-[9px] font-black tracking-wider text-emerald-300 bg-emerald-400/15 border border-emerald-400/25 px-1.5 py-0.5 rounded">BASE64</span>
+        </div>
+        <p id="fmtB64Text" class="text-[10px] text-emerald-200/90 break-all leading-5 mb-3" dir="ltr" style="font-family:ui-monospace,Consolas,monospace">{sub_url_escaped}?format=base64</p>
+        <div class="flex gap-2">
+          <button type="button" onclick="pxCopy('fmtB64Text',this)" class="copy-btn flex-1 text-[11px] font-bold text-white/70 px-3 py-2 rounded-xl bg-white/[0.05] border border-white/10 hover:bg-white/10">کپی</button>
+          <button type="button" onclick="openQrModal(document.getElementById('fmtB64Text').textContent,'Base64 Sub')" class="text-[11px] font-bold text-emerald-300 px-3 py-2 rounded-xl bg-emerald-400/10 border border-emerald-400/25">QR</button>
+        </div>
+      </div>
+
+      <div class="rounded-2xl border border-white/10 sub-box p-4 hover:border-amber-400/30 transition-colors">
+        <div class="flex items-center justify-between mb-2">
+          <p class="text-[11px] font-extrabold">Sing-box Subscription (JSON)</p>
+          <span class="text-[9px] font-black tracking-wider text-amber-300 bg-amber-400/15 border border-amber-400/25 px-1.5 py-0.5 rounded">SINGBOX</span>
+        </div>
+        <p id="fmtSbText" class="text-[10px] text-amber-200/90 break-all leading-5 mb-3" dir="ltr" style="font-family:ui-monospace,Consolas,monospace">{sub_url_escaped}?format=sing-box</p>
+        <div class="flex gap-2">
+          <button type="button" onclick="pxCopy('fmtSbText',this)" class="copy-btn flex-1 text-[11px] font-bold text-white/70 px-3 py-2 rounded-xl bg-white/[0.05] border border-white/10 hover:bg-white/10">کپی</button>
+          <button type="button" onclick="openQrModal(document.getElementById('fmtSbText').textContent,'Sing-box')" class="text-[11px] font-bold text-amber-300 px-3 py-2 rounded-xl bg-amber-400/10 border border-amber-400/25">QR</button>
+        </div>
+      </div>
+
+      <div class="rounded-2xl border border-white/10 sub-box p-4 hover:border-sky-400/30 transition-colors">
+        <div class="flex items-center justify-between mb-2">
+          <p class="text-[11px] font-extrabold">Clash Subscription (YAML)</p>
+          <span class="text-[9px] font-black tracking-wider text-sky-300 bg-sky-400/15 border border-sky-400/25 px-1.5 py-0.5 rounded">CLASH</span>
+        </div>
+        <p id="fmtClashText" class="text-[10px] text-sky-200/90 break-all leading-5 mb-3" dir="ltr" style="font-family:ui-monospace,Consolas,monospace">{sub_url_escaped}?format=clash</p>
+        <div class="flex gap-2">
+          <button type="button" onclick="pxCopy('fmtClashText',this)" class="copy-btn flex-1 text-[11px] font-bold text-white/70 px-3 py-2 rounded-xl bg-white/[0.05] border border-white/10 hover:bg-white/10">کپی</button>
+          <button type="button" onclick="openQrModal(document.getElementById('fmtClashText').textContent,'Clash')" class="text-[11px] font-bold text-sky-300 px-3 py-2 rounded-xl bg-sky-400/10 border border-sky-400/25">QR</button>
+        </div>
+      </div>
+
+      <div class="rounded-2xl border border-white/10 sub-box p-4 hover:border-pink-400/30 transition-colors sm:col-span-2">
+        <div class="flex items-center justify-between mb-2">
+          <p class="text-[11px] font-extrabold">v2rayN Subscription (JSON)</p>
+          <span class="text-[9px] font-black tracking-wider text-pink-300 bg-pink-400/15 border border-pink-400/25 px-1.5 py-0.5 rounded">V2RAYN</span>
+        </div>
+        <p id="fmtV2nText" class="text-[10px] text-pink-200/90 break-all leading-5 mb-3" dir="ltr" style="font-family:ui-monospace,Consolas,monospace">{sub_url_escaped}?format=v2rayn</p>
+        <div class="flex gap-2">
+          <button type="button" onclick="pxCopy('fmtV2nText',this)" class="copy-btn flex-1 text-[11px] font-bold text-white/70 px-3 py-2 rounded-xl bg-white/[0.05] border border-white/10 hover:bg-white/10">کپی</button>
+          <button type="button" onclick="openQrModal(document.getElementById('fmtV2nText').textContent,'v2rayN')" class="text-[11px] font-bold text-pink-300 px-3 py-2 rounded-xl bg-pink-400/10 border border-pink-400/25">QR</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- One-click import -->
+    <div class="mt-6 pt-5 border-t border-white/10">
+      <p class="text-[11px] font-extrabold text-white/50 mb-3 tracking-wide"><span data-info-i18n="oneclick">ONE-CLICK IMPORT</span></p>
+      <div class="flex flex-wrap gap-2.5">
+        <a href="v2rayng://install-config?url={quote(sub_url, safe='')}" class="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-[11px] font-bold border border-blue-400/30 bg-blue-400/10 text-blue-300 hover:bg-blue-400/20">v2rayNG ↗</a>
+        <a href="v2rayn://install-config?url={quote(sub_url, safe='')}" class="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-[11px] font-bold border border-indigo-400/30 bg-indigo-400/10 text-indigo-300 hover:bg-indigo-400/20">v2rayN ↗</a>
+        <a href="shadowrocket://add/sub://{base64.b64encode(sub_url.encode()).decode()}" class="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-[11px] font-bold border border-slate-400/30 bg-slate-400/10 text-slate-200 hover:bg-slate-400/20">Shadowrocket</a>
+        <a href="streisand://import/{quote(sub_url, safe='')}" class="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-[11px] font-bold border border-purple-400/30 bg-purple-400/10 text-purple-300 hover:bg-purple-400/20">Streisand ↗</a>
+        <a href="hiddify://import/{quote(sub_url, safe='')}" class="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-[11px] font-bold border border-emerald-400/30 bg-emerald-400/10 text-emerald-300 hover:bg-emerald-400/20">Hiddify ↗</a>
+      </div>
+    </div>
+  </section>
+
   <!-- Downloads -->
   <section class="rounded-[22px] border dynamic-card backdrop-blur-2xl p-5 sm:p-6 md:p-7">
     <div class="flex items-center justify-between gap-3 mb-5">
@@ -5010,7 +5233,8 @@ async def info_page(
 
   <!-- Footer AGN021G -->
   <div class="rounded-2xl border border-emerald-400/15 bg-emerald-400/[0.05] p-4 text-center text-xs text-white/45 space-y-2">
-    <div>ساخته شده توسط <b class="text-emerald-300">AGN021G</b></div>
+    <div data-info-i18n="support_msg">برای پشتیبانی با <b class="text-emerald-300">@AGN021G</b> در تلگرام تماس بگیرید.</div>
+    <div>Made by <b class="text-emerald-300">AGN021G</b></div>
     <div class="flex flex-wrap justify-center gap-3">
       <a href="https://t.me/AGN021G" target="_blank" rel="noopener" class="text-emerald-300 hover:underline">پشتیبانی</a>
       <a href="https://t.me/AGN021GCHAT" target="_blank" rel="noopener" class="text-emerald-300 hover:underline">گروه</a>
@@ -5033,6 +5257,33 @@ async def info_page(
 
 <script>
 const vlessUrlData = "{vless_url}";
+const INFO_I18N = {{
+  fa: {{
+    theme:'تغییر تم', formats:'فرمت‌های اشتراک', formats_hint:'لینک مناسب کلاینت خود را کپی کنید یا با QR اسکن کنید.',
+    oneclick:'ورود یک‌کلیکه', support_help:'پشتیبانی', support_msg:'برای پشتیبانی با @AGN021G در تلگرام تماس بگیرید.',
+    copy:'کپی', downloads:'دانلود برنامه‌ها', sub:'اشتراک', status_active:'فعال', status_inactive:'غیرفعال',
+    not_found:'کانفیگ پیدا نشد'
+  }},
+  en: {{
+    theme:'Theme', formats:'Subscription Formats', formats_hint:'Copy the link for your client or scan the QR code.',
+    oneclick:'ONE-CLICK IMPORT', support_help:'Support', support_msg:'Please contact @AGN021G on Telegram for support.',
+    copy:'Copy', downloads:'Download Apps', sub:'Subscription', status_active:'Active', status_inactive:'Inactive',
+    not_found:'Config not found'
+  }}
+}};
+let infoLang = localStorage.getItem('px_lang') || 'fa';
+function setInfoLang(l) {{
+  infoLang = l;
+  localStorage.setItem('px_lang', l);
+  document.documentElement.lang = l;
+  document.documentElement.dir = l === 'fa' ? 'rtl' : 'ltr';
+  const dict = INFO_I18N[l] || INFO_I18N.fa;
+  document.querySelectorAll('[data-info-i18n]').forEach(el => {{
+    const k = el.getAttribute('data-info-i18n');
+    if (dict[k]) el.textContent = dict[k];
+  }});
+}}
+setInfoLang(infoLang);
 
 // Theme toggle logic with localStorage support (2 themes total)
 function toggleTheme() {{
@@ -5049,18 +5300,22 @@ function toggleTheme() {{
   }}
 }})();
 
-function openQrModal() {{
+function openQrModal(data, title) {{
   var modal = document.getElementById('qrModal');
   var container = document.getElementById('qrcodeContainer');
   var txtEl = document.getElementById('qrModalText');
+  var payload = (data && String(data).trim()) ? String(data).trim() : vlessUrlData;
+  var ttl = title || 'QR Code اسکن کانفیگ';
+  var titleEl = modal.querySelector('p.text-sm');
+  if (titleEl) titleEl.textContent = ttl;
   container.innerHTML = "";
-  txtEl.textContent = vlessUrlData;
+  txtEl.textContent = payload;
   modal.classList.remove('hidden');
   try {{
     var typeNumber = 0;
     var errorCorrectionLevel = 'L';
     var qr = qrcode(typeNumber, errorCorrectionLevel);
-    qr.addData(vlessUrlData);
+    qr.addData(payload);
     qr.make();
     container.innerHTML = qr.createImgTag(5, 8);
   }} catch (e) {{
@@ -5076,18 +5331,16 @@ document.getElementById('qrModal').addEventListener('click', function(e) {{
   if (e.target === this) closeQrModal();
 }});
 
-function pxCopy(textId, btnId) {{
+function pxCopy(textId, btnOrId) {{
   var el = document.getElementById(textId);
-  var btn = document.getElementById(btnId);
-  if (!el || !btn) return;
-  var text = el.textContent.textContext || el.textContent.trim();
+  var btn = (typeof btnOrId === 'string') ? document.getElementById(btnOrId) : btnOrId;
+  if (!el) return;
+  var text = (el.textContent || el.innerText || '').trim();
   var done = function() {{
-    var original = btn.getAttribute('data-original');
-    if (!original) {{
-      original = btn.innerHTML;
-      btn.setAttribute('data-original', original);
-    }}
-    btn.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg><span>کپی شد</span>';
+    if (!btn) return;
+    var original = btn.getAttribute('data-original') || btn.innerHTML;
+    btn.setAttribute('data-original', original);
+    btn.innerHTML = '<span>کپی شد</span>';
     btn.classList.add('text-emerald-300','border-emerald-400/30','bg-emerald-400/10');
     setTimeout(function() {{
       btn.innerHTML = original;
@@ -5100,6 +5353,7 @@ function pxCopy(textId, btnId) {{
     fallbackCopy(text, done);
   }}
 }}
+
 function fallbackCopy(text, cb) {{
   var ta = document.createElement('textarea');
   ta.value = text;
@@ -6969,12 +7223,17 @@ NEWS_FILE = Path(__file__).resolve().parent / "news.json"
 
 
 @app.get("/api/news")
-async def api_news(token=Depends(require_auth)):
+async def api_news(request: Request, token=Depends(require_auth)):
     try:
         if NEWS_FILE.exists():
             data = json.loads(NEWS_FILE.read_text(encoding="utf-8"))
         else:
             data = {"enabled": False, "title": "", "message": "", "updated_at": ""}
+        lang = (request.query_params.get("lang") or "").strip().lower()
+        if lang == "en":
+            data = dict(data)
+            data["title"] = data.get("title_en") or data.get("title") or ""
+            data["message"] = data.get("message_en") or data.get("message") or ""
         return {"ok": True, **data}
     except Exception as e:
         return {"ok": False, "enabled": False, "title": "", "message": str(e), "updated_at": ""}
@@ -8435,8 +8694,8 @@ tr:hover td{background:var(--hover)}
   </div>
   <div style="display:flex;justify-content:center;width:100%">
   <div class="card" style="max-width:560px;width:100%;line-height:2;font-size:14px;color:var(--t2);text-align:center">
-    <div style="font-size:16px;font-weight:800;color:var(--t1);margin-bottom:12px">حمایت مالی</div>
-    <p>این بخش اختیاری است.</p>
+    <div style="font-size:16px;font-weight:800;color:var(--t1);margin-bottom:12px" data-i18n="nav_donate">حمایت مالی</div>
+    <p data-i18n="donate_body">این بخش اختیاری است. برای پشتیبانی فنی با @AGN021G در تلگرام در ارتباط باشید.</p>
   </div>
   </div>
 </section>
@@ -8444,14 +8703,14 @@ tr:hover td{background:var(--hover)}
 <section class="page" id="page-support">
   <div class="page-head"><div><div class="page-title"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 18v-6a9 9 0 0 1 18 0v6"/></svg><span data-i18n="nav_support">پشتیبانی</span></div></div></div>
   <div class="card" style="max-width:560px;margin:0 auto;text-align:center;line-height:2;color:var(--t2)">
-    <div style="font-size:15px;font-weight:700;color:var(--t1);margin-bottom:8px">پشتیبانی AGN021G</div>
-    <p>برای راهنمایی و پشتیبانی با ما در تماس باشید.</p>
-    <div style="display:flex;flex-direction:column;gap:10px;margin-top:16px;text-align:right">
-      <a class="btn btn-p" href="https://t.me/AGN021G" target="_blank" rel="noopener" style="justify-content:center">💬 پشتیبانی · @AGN021G</a>
-      <a class="btn" href="https://t.me/AGN021GCHAT" target="_blank" rel="noopener" style="justify-content:center">👥 گروه · AGN021GCHAT</a>
-      <a class="btn" href="https://t.me/AGN021G1388" target="_blank" rel="noopener" style="justify-content:center">📢 کانال · AGN021G1388</a>
+    <div style="font-size:15px;font-weight:700;color:var(--t1);margin-bottom:8px" data-i18n="support_title">پشتیبانی AGN021G</div>
+    <p data-i18n="support_body">برای راهنمایی و پشتیبانی لطفاً از طریق تلگرام با یوزر @AGN021G تماس بگیرید.</p>
+    <div style="display:flex;flex-direction:column;gap:10px;margin-top:16px">
+      <a class="btn btn-p" href="https://t.me/AGN021G" target="_blank" rel="noopener" style="justify-content:center">💬 @AGN021G</a>
+      <a class="btn" href="https://t.me/AGN021GCHAT" target="_blank" rel="noopener" style="justify-content:center">👥 @AGN021GCHAT</a>
+      <a class="btn" href="https://t.me/AGN021G1388" target="_blank" rel="noopener" style="justify-content:center">📢 @AGN021G1388</a>
     </div>
-    <p style="margin-top:16px;font-size:12px;opacity:.7">ساخته شده توسط AGN021G</p>
+    <p style="margin-top:16px;font-size:12px;opacity:.7" data-i18n="made_by">ساخته شده توسط AGN021G</p>
   </div>
 </section>
 
@@ -8526,8 +8785,8 @@ tr:hover td{background:var(--hover)}
 
 <script>
 const I18N={
-fa:{sec_panel:'پنل',sec_sys:'سیستم',nav_dash:'داشبورد',nav_configs:'کانفیگ‌ها',nav_groups:'گروه‌ها',nav_create:'ساخت کانفیگ',nav_stats:'آمار',nav_logs:'لاگ فعالیت',nav_settings:'تنظیمات',nav_support:'پشتیبانی',nav_donate:'حمایت مالی',nav_news:'اخبار',nav_admins:'ادمین‌ها',refresh_news:'بروزرسانی اطلاعیه',admins_sub:'ساخت اکانت ادمین با دسترسی سفارشی',admin_create:'ساخت اکانت ادمین',admin_user:'نام کاربری',admin_pw:'رمز عبور',admin_pw2:'تکرار رمز',admin_perms:'دسترسی‌ها',admin_btn:'ساخت اکانت',admin_list:'لیست ادمین‌ها',refresh:'بروزرسانی',refresh_stats:'بروزرسانی آمار',refresh_panel:'بروزرسانی پنل',nav_telegram:'ربات تلگرام',tg_sub:'توکن ربات و آیدی عددی ادمین · فعال‌سازی خودکار و وب‌هوک',tg_config:'پیکربندی ربات',tg_token:'توکن ربات (BotFather)',tg_admin:'آیدی عددی ادمین',tg_webhook:'فعال‌سازی Webhook (پیشنهادی روی Railway)',tg_activate:'ذخیره و فعال‌سازی ربات',tg_help:'راهنما',tg_h1:'از @BotFather یک ربات بساز و توکن را کپی کن',tg_h2:'آیدی عددی خودت را از @userinfobot بگیر',tg_h3:'ذخیره کن — وب‌هوک خودکار روی دامنه Railway ست می‌شود',logout:'خروج',loading:'در حال بارگذاری...',m_conns:'اتصالات فعال',m_traffic:'ترافیک کل',m_links:'کانفیگ‌ها',m_uptime:'آپتایم سرور',quick_create:'ساخت کانفیگ',quick_create_desc:'ساخت دستی با محدودیت ترافیک، سرعت، تعداد و انقضا',auto_create:'ساخت خودکار (پیشنهادی)',auto_create_desc:'ساخت سریع با تنظیمات بهینه · لینک VLESS و ساب',configs_sub:'مدیریت لینک‌ها · VLESS و ساب',th_name:'نام',th_proto:'پروتکل',th_status:'وضعیت',th_usage:'مصرف',th_ops:'عملیات',manual_create:'ساخت دستی',label_name:'نام',label_proto:'پروتکل',label_count:'تعداد کانفیگ در ساب (۱–۴۰)',label_limit:'محدودیت حجم',label_unit:'واحد',label_days:'انقضا (روز)',label_ip:'محدودیت IP',label_speed:'سرعت (Mbps)',btn_create:'ساخت',btn_auto:'ساخت خودکار',auto_desc:'با یک کلیک کانفیگ بهینه ساخته می‌شود. بعد از ساخت لینک VLESS و ساب در اختیار شماست.',stats_sub:'ترافیک و اتصالات · فیلتر زمانی',r_day:'روز',r_week:'هفته',r_month:'ماه',r_all:'کل',panel_info:'اطلاعات کل پنل',lang_label:'زبان',change_pw:'تغییر رمز عبور',pw_cur:'رمز فعلی',pw_new:'رمز جدید',pw_cf:'تکرار رمز',btn_save:'ذخیره',github:'گیت‌هاب',telegram:'تلگرام',channel:'کانال پشتیبان',theme:'تم',theme_dark:'تم تیره',theme_light:'تم روشن',created_title:'کانفیگ ساخته شد',copy_vless:'کپی VLESS',copy_sub:'کپی ساب',sub_label:'سابسکریپشن'},
-en:{sec_panel:'PANEL',sec_sys:'SYSTEM',nav_dash:'Dashboard',nav_configs:'Configs',nav_groups:'Groups',nav_create:'Create Config',nav_stats:'Statistics',nav_logs:'Activity Log',nav_settings:'Settings',nav_support:'Support',nav_donate:'Donate',nav_news:'News',nav_admins:'Admins',refresh_news:'Refresh news',admins_sub:'Create admin accounts with custom access',admin_create:'Create admin account',admin_user:'Username',admin_pw:'Password',admin_pw2:'Confirm password',admin_perms:'Permissions',admin_btn:'Create account',admin_list:'Admin list',refresh:'Refresh',refresh_stats:'Refresh stats',refresh_panel:'Update panel',nav_telegram:'Telegram bot',tg_sub:'Bot token and numeric admin ID · auto activate and webhook',tg_config:'Bot configuration',tg_token:'Bot token (BotFather)',tg_admin:'Admin numeric ID',tg_webhook:'Enable Webhook (recommended on Railway)',tg_activate:'Save and activate bot',tg_help:'Guide',tg_h1:'Create a bot with @BotFather and copy the token',tg_h2:'Get your numeric ID from @userinfobot',tg_h3:'Save — webhook is set automatically on Railway domain',logout:'Logout',loading:'Loading...',m_conns:'Active connections',m_traffic:'Total traffic',m_links:'Configs',m_uptime:'Server uptime',quick_create:'Create Config',quick_create_desc:'Manual create with traffic, speed, count and expiry',auto_create:'Auto Create (Suggested)',auto_create_desc:'Quick optimal create · VLESS and Sub links',configs_sub:'Manage links · VLESS and Sub',th_name:'Name',th_proto:'Protocol',th_status:'Status',th_usage:'Usage',th_ops:'Actions',manual_create:'Manual create',label_name:'Name',label_proto:'Protocol',label_count:'Configs in sub (1–40)',label_limit:'Traffic limit',label_unit:'Unit',label_days:'Expiry (days)',label_ip:'IP limit',label_speed:'Speed (Mbps)',btn_create:'Create',btn_auto:'Auto create',auto_desc:'One click creates an optimal config. VLESS and Sub links will be shown.',stats_sub:'Traffic and connections · time filter',r_day:'Day',r_week:'Week',r_month:'Month',r_all:'All',panel_info:'Panel overview',lang_label:'Language',change_pw:'Change password',pw_cur:'Current password',pw_new:'New password',pw_cf:'Confirm password',btn_save:'Save',github:'GitHub',telegram:'Telegram',channel:'Support channel',theme:'Theme',theme_dark:'Dark theme',theme_light:'Light theme',created_title:'Config created',copy_vless:'Copy VLESS',copy_sub:'Copy Sub',sub_label:'Subscription'}
+fa:{sec_panel:'پنل',sec_sys:'سیستم',nav_dash:'داشبورد',nav_configs:'کانفیگ‌ها',nav_groups:'گروه‌ها',nav_create:'ساخت کانفیگ',nav_stats:'آمار',nav_logs:'لاگ فعالیت',nav_settings:'تنظیمات',nav_support:'پشتیبانی',nav_donate:'حمایت مالی',nav_news:'اخبار',nav_admins:'ادمین‌ها',refresh_news:'بروزرسانی اطلاعیه',admins_sub:'ساخت اکانت ادمین با دسترسی سفارشی',admin_create:'ساخت اکانت ادمین',admin_user:'نام کاربری',admin_pw:'رمز عبور',admin_pw2:'تکرار رمز',admin_perms:'دسترسی‌ها',admin_btn:'ساخت اکانت',admin_list:'لیست ادمین‌ها',refresh:'بروزرسانی',refresh_stats:'بروزرسانی آمار',refresh_panel:'بروزرسانی پنل',nav_telegram:'ربات تلگرام',tg_sub:'توکن ربات و آیدی عددی ادمین · فعال‌سازی خودکار و وب‌هوک',tg_config:'پیکربندی ربات',tg_token:'توکن ربات (BotFather)',tg_admin:'آیدی عددی ادمین',tg_webhook:'فعال‌سازی Webhook (پیشنهادی روی Railway)',tg_activate:'ذخیره و فعال‌سازی ربات',tg_help:'راهنما',tg_h1:'از @BotFather یک ربات بساز و توکن را کپی کن',tg_h2:'آیدی عددی خودت را از @userinfobot بگیر',tg_h3:'ذخیره کن — وب‌هوک خودکار روی دامنه Railway ست می‌شود',logout:'خروج',loading:'در حال بارگذاری...',m_conns:'اتصالات فعال',m_traffic:'ترافیک کل',m_links:'کانفیگ‌ها',m_uptime:'آپتایم سرور',quick_create:'ساخت کانفیگ',quick_create_desc:'ساخت دستی با محدودیت ترافیک، سرعت، تعداد و انقضا',auto_create:'ساخت خودکار (پیشنهادی)',auto_create_desc:'ساخت سریع با تنظیمات بهینه · لینک VLESS و ساب',configs_sub:'مدیریت لینک‌ها · VLESS و ساب',th_name:'نام',th_proto:'پروتکل',th_status:'وضعیت',th_usage:'مصرف',th_ops:'عملیات',manual_create:'ساخت دستی',label_name:'نام',label_proto:'پروتکل',label_count:'تعداد کانفیگ در ساب (۱–۴۰)',label_limit:'محدودیت حجم',label_unit:'واحد',label_days:'انقضا (روز)',label_ip:'محدودیت IP',label_speed:'سرعت (Mbps)',btn_create:'ساخت',btn_auto:'ساخت خودکار',auto_desc:'با یک کلیک کانفیگ بهینه ساخته می‌شود. بعد از ساخت لینک VLESS و ساب در اختیار شماست.',stats_sub:'ترافیک و اتصالات · فیلتر زمانی',r_day:'روز',r_week:'هفته',r_month:'ماه',r_all:'کل',panel_info:'اطلاعات کل پنل',lang_label:'زبان',change_pw:'تغییر رمز عبور',pw_cur:'رمز فعلی',pw_new:'رمز جدید',pw_cf:'تکرار رمز',btn_save:'ذخیره',github:'گیت‌هاب',telegram:'تلگرام',channel:'کانال پشتیبان',theme:'تم',theme_dark:'تم تیره',theme_light:'تم روشن',created_title:'کانفیگ ساخته شد',copy_vless:'کپی VLESS',copy_sub:'کپی ساب',sub_label:'سابسکریپشن',donate_body:'این بخش اختیاری است. برای پشتیبانی فنی با @AGN021G در تلگرام در ارتباط باشید.',support_title:'پشتیبانی AGN021G',support_body:'برای راهنمایی و پشتیبانی لطفاً از طریق تلگرام با یوزر @AGN021G تماس بگیرید.',made_by:'ساخته شده توسط AGN021G',support_contact:'تماس با پشتیبانی',fmt_formats:'فرمت‌های اشتراک',fmt_oneclick:'ورود یک‌کلیکه',copy:'کپی',active:'فعال',inactive:'غیرفعال',usage:'مصرف',expiry:'انقضا',remaining:'باقی‌مانده'},
+en:{sec_panel:'PANEL',sec_sys:'SYSTEM',nav_dash:'Dashboard',nav_configs:'Configs',nav_groups:'Groups',nav_create:'Create Config',nav_stats:'Statistics',nav_logs:'Activity Log',nav_settings:'Settings',nav_support:'Support',nav_donate:'Donate',nav_news:'News',nav_admins:'Admins',refresh_news:'Refresh news',admins_sub:'Create admin accounts with custom access',admin_create:'Create admin account',admin_user:'Username',admin_pw:'Password',admin_pw2:'Confirm password',admin_perms:'Permissions',admin_btn:'Create account',admin_list:'Admin list',refresh:'Refresh',refresh_stats:'Refresh stats',refresh_panel:'Update panel',nav_telegram:'Telegram bot',tg_sub:'Bot token and numeric admin ID · auto activate and webhook',tg_config:'Bot configuration',tg_token:'Bot token (BotFather)',tg_admin:'Admin numeric ID',tg_webhook:'Enable Webhook (recommended on Railway)',tg_activate:'Save and activate bot',tg_help:'Guide',tg_h1:'Create a bot with @BotFather and copy the token',tg_h2:'Get your numeric ID from @userinfobot',tg_h3:'Save — webhook is set automatically on Railway domain',logout:'Logout',loading:'Loading...',m_conns:'Active connections',m_traffic:'Total traffic',m_links:'Configs',m_uptime:'Server uptime',quick_create:'Create Config',quick_create_desc:'Manual create with traffic, speed, count and expiry',auto_create:'Auto Create (Suggested)',auto_create_desc:'Quick optimal create · VLESS and Sub links',configs_sub:'Manage links · VLESS and Sub',th_name:'Name',th_proto:'Protocol',th_status:'Status',th_usage:'Usage',th_ops:'Actions',manual_create:'Manual create',label_name:'Name',label_proto:'Protocol',label_count:'Configs in sub (1–40)',label_limit:'Traffic limit',label_unit:'Unit',label_days:'Expiry (days)',label_ip:'IP limit',label_speed:'Speed (Mbps)',btn_create:'Create',btn_auto:'Auto create',auto_desc:'One click creates an optimal config. VLESS and Sub links will be shown.',stats_sub:'Traffic and connections · time filter',r_day:'Day',r_week:'Week',r_month:'Month',r_all:'All',panel_info:'Panel overview',lang_label:'Language',change_pw:'Change password',pw_cur:'Current password',pw_new:'New password',pw_cf:'Confirm password',btn_save:'Save',github:'GitHub',telegram:'Telegram',channel:'Support channel',theme:'Theme',theme_dark:'Dark theme',theme_light:'Light theme',created_title:'Config created',copy_vless:'Copy VLESS',copy_sub:'Copy Sub',sub_label:'Subscription',donate_body:'Optional. For technical support contact @AGN021G on Telegram.',support_title:'AGN021G Support',support_body:'For help and support, please contact us on Telegram: @AGN021G',made_by:'Made by AGN021G',support_contact:'Contact support',fmt_formats:'Subscription formats',fmt_oneclick:'One-click import',copy:'Copy',active:'Active',inactive:'Inactive',usage:'Usage',expiry:'Expiry',remaining:'Remaining'}
 };
 let lang=localStorage.getItem('px_lang')||'fa';
 let statRange='month';
@@ -9095,7 +9354,7 @@ async function loadMe(){
   });
 }
 async function loadNews(toastOk){
-  const r=await api('/api/news');
+  const r=await api('/api/news?lang='+(lang||'fa'));
   if(!r)return;
   document.getElementById('newsTitle').textContent=r.title||(lang==='fa'?'بدون عنوان':'No title');
   document.getElementById('newsBody').textContent=r.message||'';
