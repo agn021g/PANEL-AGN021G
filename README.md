@@ -27,13 +27,11 @@
 1. این ریپو را Deploy کنید
 2. Volume روی `/data`
 3. Public Domain فعال
-4. متغیرها:
+4. متغیرها **اختیاری** هستند. توکن و ادمین ربات را از داخل داشبورد (بخش ربات تلگرام) وارد کن؛ در Volume ذخیره می‌شود.
 
-```
-TELEGRAM_BOT_TOKEN=...
-TELEGRAM_ADMIN_IDS=123456789
-PANEL_PATH=my-secret
-```
+   در صورت نیاز:
+   - `PANEL_PATH` — مسیر مخفی پنل (وگرنه خودکار ساخته می‌شود)
+   - `TELEGRAM_BOT_TOKEN` / `TELEGRAM_ADMIN_IDS` — فقط اگر نخواهی از UI ست کنی
 
 5. در Railway: **Enable Outbound IPv6** (اختیاری ولی توصیه‌شده)
 

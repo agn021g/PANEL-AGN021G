@@ -159,8 +159,8 @@ app.add_middleware(
 
 
 def _is_public_path(path: str) -> bool:
-    """Paths reachable without secret PANEL_PATH (subs, health, public pages)."""
-    if path in ("/health", "/sub-all"):
+    """Paths reachable without secret PANEL_PATH (subs, health, tunnels, public pages)."""
+    if path in ("/health", "/sub-all", "/"):
         return True
     public_prefixes = (
         "/sub/",
@@ -169,6 +169,8 @@ def _is_public_path(path: str) -> bool:
         "/info/",
         "/api/public/",
         "/telegram/webhook",
+        "/ws/",              # VLESS / VMess / Trojan WebSocket tunnel
+        "/xhttp-siz10/",     # XHTTP tunnel (packet-up / stream-up / stream-one)
     )
     for pref in public_prefixes:
         if path == pref.rstrip("/") or path.startswith(pref):
@@ -180,9 +182,13 @@ def _is_public_path(path: str) -> bool:
 async def panel_secret_path_middleware(request: Request, call_next):
     """
     Force admin UI/API behind /{PANEL_PATH}/...
-    Public subscription routes stay open.
+    Public subscription + tunnel routes stay open.
     Unknown paths without the secret prefix return 404 (no panel leak).
     """
+    # WebSocket upgrades must never be rewritten/blocked by this middleware
+    if request.scope.get("type") == "websocket":
+        return await call_next(request)
+
     path = request.scope.get("path") or request.url.path or "/"
     # normalize
     if not path.startswith("/"):
@@ -2579,7 +2585,7 @@ table th:first-child, table td:first-child{overflow:visible}
 
 <div class="brand">
 
-<div class="logo">P</div>
+<div class="logo">AG</div>
 
 <div>
 <div class="brand-name">
@@ -7644,7 +7650,7 @@ DASHBOARD_HTML = r"""
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
-<title>Panel</title>
+<title>AGN021G</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;500;600;700;800&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
@@ -7899,7 +7905,7 @@ tr:hover td{background:var(--hover)}
 <div class="bg-orbs" aria-hidden="true"><span></span><span></span><span></span><span></span></div>
 
 <div class="mob-bar">
-  <div style="font-weight:800;font-size:15px">Panel</div>
+  <div style="font-weight:800;font-size:15px">AGN021G</div>
   <button class="btn btn-sm" id="mobMenuBtn" aria-label="menu">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="20" height="20"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
   </button>
@@ -7911,10 +7917,10 @@ tr:hover td{background:var(--hover)}
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M15 18l-6-6 6-6"/></svg>
   </button>
   <div class="sb-logo">
-    <div class="sb-logo-icon">PX</div>
+    <div class="sb-logo-icon">AG</div>
     <div class="sb-logo-text">
-      <div class="sb-logo-name">Panel</div>
-      <div class="sb-logo-ver">v13.9.4</div>
+      <div class="sb-logo-name">AGN021G</div>
+      <div class="sb-logo-ver">v14.1.0</div>
     </div>
   </div>
   <nav class="nav">
@@ -7982,7 +7988,7 @@ tr:hover td{background:var(--hover)}
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" width="16" height="16"><path d="M23 4v6h-6M1 20v-6h6"/><path d="M3.5 9a9 9 0 0 1 14.1-3.4L23 10M1 14l5.4 4.4A9 9 0 0 0 20.5 15"/></svg>
       <span data-i18n="refresh_stats">بروزرسانی امـار</span>
     </button>
-    <button type="button" onclick="panelUpdate()" title="Panel" style="background:rgba(16,185,129,.12);border-color:rgba(16,185,129,.35);color:#34d399">
+    <button type="button" onclick="panelUpdate()" title="AGN021G" style="background:rgba(16,185,129,.12);border-color:rgba(16,185,129,.35);color:#34d399">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" width="16" height="16"><path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/><path d="M16 16h5v5"/></svg>
       <span data-i18n="refresh_panel">بروزرسانی پنـل</span>
     </button>

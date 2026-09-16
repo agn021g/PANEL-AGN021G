@@ -308,8 +308,10 @@ def _downstream_gen(sess: dict):
 @router.get("/xhttp-siz10/{mode}/{uuid}/{session_id}")
 async def xhttp_downlink(mode: str, uuid: str, session_id: str, request: Request):
     ensure_reaper()
-    if mode not in ("packet-up", "stream-up"):
+    if mode not in ("packet-up", "stream-up", "stream-one"):
         raise HTTPException(status_code=404, detail="unknown mode")
+    if mode == "stream-one":
+        mode = "stream-up"
     await _check_link(uuid)
     fp = request.query_params.get("fp", DEFAULT_FINGERPRINT)
     sess = await _get_or_create_session(uuid, mode, session_id, _req_client_ip(request))
@@ -432,3 +434,9 @@ async def stream_up_upload(uuid: str, session_id: str, request: Request):
 
     await gate.flush()
     return {"ok": True}
+
+
+@router.post("/xhttp-siz10/stream-one/{uuid}/{session_id}")
+async def stream_one_upload(uuid: str, session_id: str, request: Request):
+    return await stream_up_upload(uuid, session_id, request)
+
