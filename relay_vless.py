@@ -89,7 +89,7 @@ async def check_and_use(uid: str, n: int) -> bool:
         if not link.get("active", True):
             return False
         try:
-            if is_link_expired(link):
+            if _M().is_link_expired(link):
                 return False
         except Exception:
             pass

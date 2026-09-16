@@ -24,6 +24,7 @@ from fastapi import (
     Request,
     HTTPException,
     Depends,
+    WebSocket,
 )
 from fastapi.responses import (
     Response,
@@ -38,7 +39,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # ============================================================
 
 APP_NAME = "AGN021G"
-APP_VERSION = "14.2.1"
+APP_VERSION = "14.2.2"
 
 # برند و پشتیبانی AGN021G
 SUPPORT_USERNAME = "AGN021G"
@@ -6763,23 +6764,52 @@ async def get_connections(
 # DO NOT REPLACE THIS VLESS CORE.
 # ============================================================
 
-try:
-    from relay_vless import websocket_tunnel
-    app.add_api_websocket_route("/ws/{uuid}", websocket_tunnel)
-    # also mount without trailing issues
-    logger.info("VLESS relay loaded — WS /ws/{uuid}")
-except Exception as exc:
-    logger.exception("VLESS relay module unavailable: %s", exc)
+# ── VLESS WebSocket tunnel (always registered; relay imported lazily) ──
+RELAY_LOAD_ERROR: str | None = None
 
-# Diagnostic (HTTP only — must NOT share path with WebSocket /ws/{uuid})
+@app.websocket("/ws/{uuid}")
+async def vless_ws_endpoint(websocket: WebSocket, uuid: str):
+    """Entry point — import relay inside so route always exists even if relay has issues at import time."""
+    global RELAY_LOAD_ERROR
+    try:
+        from relay_vless import websocket_tunnel
+    except Exception as exc:
+        RELAY_LOAD_ERROR = f"{type(exc).__name__}: {exc}"
+        logger.exception("relay import failed: %s", exc)
+        try:
+            await websocket.close(code=1011, reason="relay unavailable")
+        except Exception:
+            pass
+        return
+    try:
+        await websocket_tunnel(websocket, uuid)
+    except Exception as exc:
+        logger.exception("websocket_tunnel error: %s", exc)
+        try:
+            await websocket.close(code=1011, reason="tunnel error")
+        except Exception:
+            pass
+
+
 @app.get("/api/public/tunnel-check")
 async def tunnel_check():
-    has_ws = any(getattr(r, "path", None) == "/ws/{uuid}" for r in app.routes)
+    ws_paths = []
+    for r in app.routes:
+        path = getattr(r, "path", None) or ""
+        name = type(r).__name__
+        if "ws" in path.lower() or "WebSocket" in name:
+            ws_paths.append({"type": name, "path": path})
+    has_ws = any(
+        (getattr(r, "path", None) == "/ws/{uuid}" and "WebSocket" in type(r).__name__)
+        for r in app.routes
+    )
     return {
         "ok": True,
         "service": APP_NAME,
         "version": APP_VERSION,
         "websocket_route": has_ws,
+        "ws_routes": ws_paths,
+        "relay_error": RELAY_LOAD_ERROR,
         "hint": "VLESS path is wss://HOST/ws/<uuid>",
     }
 
