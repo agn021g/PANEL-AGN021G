@@ -161,7 +161,13 @@ async def _open_tcp_from_header(first_chunk: bytes):
 async def _check_link(uuid: str):
     async with LINKS_LOCK:
         link = LINKS.get(uuid)
-    if not is_link_allowed(link):
+        if link is None:
+            compact = (uuid or "").replace("-", "")
+            for k, v in LINKS.items():
+                if (k or "").replace("-", "") == compact:
+                    link = v
+                    break
+    if link is None or not is_link_allowed(link):
         raise HTTPException(status_code=403, detail="not authorized")
 
 

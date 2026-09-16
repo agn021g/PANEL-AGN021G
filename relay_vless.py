@@ -255,14 +255,32 @@ async def open_dual_stack(address: str, port: int, timeout: float = 12.0):
     raise last_err or OSError("connect failed")
 
 
+def _resolve_link(uuid: str):
+    """Find link by uuid (exact or without dashes)."""
+    link = LINKS.get(uuid)
+    if link is not None:
+        return uuid, link
+    compact = (uuid or "").replace("-", "")
+    if compact and compact != uuid:
+        for k, v in LINKS.items():
+            if (k or "").replace("-", "") == compact:
+                return k, v
+    return uuid, None
+
+
 async def websocket_tunnel(ws: WebSocket, uuid: str):
     await ws.accept()
 
     async with LINKS_LOCK:
-        link = LINKS.get(uuid)
+        uuid, link = _resolve_link(uuid)
+
+    if link is None:
+        logger.warning(f"🚫 WS unknown uuid={uuid[:12]}… links={len(LINKS)}")
+        await ws.close(code=1008, reason="unknown uuid")
+        return
 
     if not is_link_allowed(link):
-        logger.warning(f"🚫 WS rejected uuid={uuid[:8]}… (not allowed)")
+        logger.warning(f"🚫 WS rejected uuid={uuid[:8]}… (not allowed active={link.get('active')} expired?)")
         await ws.close(code=1008, reason="not authorized")
         return
 

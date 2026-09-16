@@ -208,19 +208,49 @@ def _is_admin(chat_id: int) -> bool:
 
 
 async def _check_membership(user_id: int) -> bool:
-    """True if force-join disabled or user is member of required channel."""
+    """True if force-join disabled, user is panel admin, or member of required channel."""
     if not FORCE_JOIN.get("enabled"):
         return True
+    # ادمین‌های پنل همیشه عبور می‌کنند (حتی اگر ربات ادمین کانال نباشد)
+    try:
+        if int(user_id) in ADMIN_IDS:
+            return True
+    except Exception:
+        pass
     ch = (FORCE_JOIN.get("channel") or "").strip()
     if not ch:
         return True
-    if not ch.startswith("@") and not ch.lstrip("-").isdigit():
-        ch = "@" + ch
-    res = await _call("getChatMember", chat_id=ch, user_id=user_id)
-    if not res or not res.get("ok"):
-        return False
-    status = (res.get("result") or {}).get("status", "")
-    return status in ("creator", "administrator", "member", "restricted")
+    # نرمال‌سازی چند حالت: @name / name / -100id
+    candidates = []
+    raw = ch
+    if raw.startswith("@"):
+        candidates.append(raw)
+        candidates.append(raw[1:])
+    elif raw.lstrip("-").isdigit():
+        candidates.append(int(raw) if raw.lstrip("-").isdigit() else raw)
+        candidates.append(raw)
+    else:
+        candidates.append("@" + raw)
+        candidates.append(raw)
+    last_err = None
+    for chat_id in candidates:
+        res = await _call("getChatMember", chat_id=chat_id, user_id=int(user_id))
+        if not res:
+            continue
+        if res.get("ok"):
+            status = (res.get("result") or {}).get("status", "")
+            # left / kicked = not member
+            if status in ("creator", "administrator", "member", "restricted"):
+                return True
+            return False
+        last_err = res.get("description") or res
+        # اگر ربات ادمین کانال نیست، برای جلوگیری از قفل شدن همه، لاگ کن
+        desc = str(res.get("description") or "")
+        if "chat not found" in desc.lower() or "bot is not a member" in desc.lower() or "have no rights" in desc.lower():
+            logger.warning(f"force_join getChatMember failed ({chat_id}): {desc}")
+    if last_err:
+        logger.warning(f"force_join check failed for user={user_id}: {last_err}")
+    return False
 
 
 def _force_join_kb():
@@ -686,11 +716,14 @@ async def _wizard_finish(chat_id: int, data: dict):
 
 # ── Guards ───────────────────────────────────────────────────────────────────
 async def _guard(chat_id: int, user_id: int | None = None, admin_only: bool = False) -> bool:
-    """عضویت اجباری برای همه؛ admin_only برای بخش مدیریت پنل."""
+    """عضویت اجباری برای کاربران عادی؛ ادمین پنل همیشه عبور می‌کند."""
     uid = user_id if user_id is not None else chat_id
     if admin_only and not _is_admin(chat_id):
         await _send(chat_id, "⛔ این بخش فقط برای ادمین است.", _main_menu_kb(chat_id))
         return False
+    # ادمین پنل → بدون چک کانال
+    if _is_admin(chat_id) or _is_admin(uid):
+        return True
     if not FORCE_JOIN.get("enabled"):
         return True
     ch = (FORCE_JOIN.get("channel") or "").strip()
@@ -927,12 +960,16 @@ async def _handle_callback(cb: dict):
 
     # force-join check button — available even when blocked
     if data == "fj:check":
-        ok = await _check_membership(user_id)
+        ok = _is_admin(user_id) or _is_admin(chat_id) or await _check_membership(user_id)
         if ok:
             await _answer_cb(cb_id, "✅ عضویت تأیید شد")
             await _edit(chat_id, mid, _welcome_text(chat_id), _main_menu_kb(chat_id))
         else:
-            await _answer_cb(cb_id, "هنوز عضو نیستید", alert=True)
+            await _answer_cb(
+                cb_id,
+                "هنوز عضو نیستید.\nاگر عضو هستید: ربات را در کانال ادمین کنید.",
+                alert=True,
+            )
         return
 
     

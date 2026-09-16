@@ -38,7 +38,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # ============================================================
 
 APP_NAME = "AGN021G"
-APP_VERSION = "14.1.0"
+APP_VERSION = "14.1.1"
 
 # برند و پشتیبانی AGN021G
 SUPPORT_USERNAME = "AGN021G"
@@ -1288,7 +1288,7 @@ def generate_vless_link(
         if sec == "tls":
             q["sni"] = host
             q["alpn"] = alpn_value or "http/1.1"
-        return "vless://" + uuid + "@" + host_url + ":" + str(port_value) + "?" + "&".join(f"{k}={quote(str(v), safe=',/') }" for k,v in q.items()) + "#" + label
+        return "vless://" + uuid + "@" + host_url + ":" + str(port_value) + "?" + "&".join(f"{k}={quote(str(v), safe=',/')}" for k,v in q.items()) + "#" + label
     if protocol.startswith("xhttp-"):
         mode = protocol.replace("xhttp-", "")
         q = {
@@ -1304,7 +1304,7 @@ def generate_vless_link(
         if sec == "tls":
             q["sni"] = host
             q["alpn"] = alpn_value or "h2,http/1.1"
-        return "vless://" + uuid + "@" + host_url + ":" + str(port_value) + "?" + "&".join(f"{k}={quote(str(v), safe=',/') }" for k,v in q.items()) + "#" + label
+        return "vless://" + uuid + "@" + host_url + ":" + str(port_value) + "?" + "&".join(f"{k}={quote(str(v), safe=',/')}" for k,v in q.items()) + "#" + label
     if protocol == "vmess-ws":
         raw = {"v":"2","ps":remark,"add":host,"port":port_value,"id":uuid,"aid":0,"scy":"auto","net":"ws","type":"none","host":host,"path":f"/ws/{uuid}","tls":"tls","sni":host,"fp":fp}
         return "vmess://" + base64.b64encode(json.dumps(raw,separators=(",",":"),ensure_ascii=False).encode()).decode()
@@ -9659,4 +9659,6 @@ if __name__ == "__main__":
         port=PORT,
         log_level="info",
         workers=1,
+        proxy_headers=True,
+        forwarded_allow_ips="*",
     )
