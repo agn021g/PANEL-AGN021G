@@ -4091,12 +4091,13 @@ async def create_multi_auto_link(request: Request, _=Depends(require_auth)):
 
     profile = str(body.get("profile", "balanced")).strip().lower()
     profiles = {
+        # conn=0 means unlimited concurrent connections (browsers open many)
         "normal": {"ip": 0, "conn": 0, "fp": "chrome", "fragment": "off"},
-        "balanced": {"ip": 2, "conn": 6, "fp": "chrome", "fragment": "safe"},
-        "gaming": {"ip": 1, "conn": 3, "fp": "chrome", "fragment": "safe"},
+        "balanced": {"ip": 0, "conn": 0, "fp": "chrome", "fragment": "off"},
+        "gaming": {"ip": 0, "conn": 0, "fp": "chrome", "fragment": "off"},
         "speed": {"ip": 0, "conn": 0, "fp": "chrome", "fragment": "off"},
-        "stable": {"ip": 2, "conn": 4, "fp": "firefox", "fragment": "tlshello"},
-        "maximum": {"ip": 0, "conn": 0, "fp": "randomized", "fragment": "safe"},
+        "stable": {"ip": 0, "conn": 0, "fp": "firefox", "fragment": "off"},
+        "maximum": {"ip": 0, "conn": 0, "fp": "randomized", "fragment": "off"},
     }
     cfg = profiles.get(profile, profiles["balanced"])
     if ip_limit <= 0:

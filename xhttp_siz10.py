@@ -277,8 +277,8 @@ def ensure_reaper():
 
 
 async def _pump_tcp_to_queue(session_id: str, uuid: str, reader: asyncio.StreamReader, down_q: asyncio.Queue):
-    first = True
-    gate = _QuotaGate(uuid) 
+    """TCP→queue. VLESS response already queued when session opens TCP."""
+    gate = _QuotaGate(uuid)
     try:
         while True:
             data = await reader.read(XHTTP_BUF)
@@ -290,16 +290,21 @@ async def _pump_tcp_to_queue(session_id: str, uuid: str, reader: asyncio.StreamR
             async with XHTTP_LOCK:
                 sess = xhttp_sessions.get(session_id)
             if sess:
-                c = connections.get(sess["conn_id"])
-                if c:
-                    c["bytes"] += len(data)
-            payload = (b"\x00\x00" + data) if first else data
-            first = False
-            await down_q.put(payload)
+                try:
+                    c = _M().connections.get(sess["conn_id"])
+                    if c:
+                        c["bytes"] += len(data)
+                except Exception:
+                    pass
+            await down_q.put(data)
     except (asyncio.CancelledError, Exception):
         pass
     finally:
         await gate.flush()
+        try:
+            await down_q.put(None)
+        except Exception:
+            pass
         await _teardown(session_id)
 
 
@@ -308,6 +313,15 @@ async def _open_tcp_for_session(session_id: str, uuid: str, sess: dict, first_ch
     logger.info(f"connect XHTTP[{sess['mode']}] [{session_id[:8]}] -> {address}:{port}")
     sess["writer"] = writer
     sess["tcp_open"] = True
+    # VLESS success on downlink immediately
+    try:
+        ver = first_chunk[0:1] if first_chunk else bytes([0])
+        await sess["down_q"].put(ver + bytes([0]))
+    except Exception:
+        try:
+            await sess["down_q"].put(bytes([0, 0]))
+        except Exception:
+            pass
     sess["downlink_task"] = asyncio.create_task(
         _pump_tcp_to_queue(session_id, uuid, reader, sess["down_q"])
     )

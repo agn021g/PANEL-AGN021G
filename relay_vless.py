@@ -237,7 +237,8 @@ async def open_dual_stack(address: str, port: int, timeout: float = 10.0):
     except ValueError:
         pass  # not an IP literal
     except Exception as e:
-        raise e
+        logger.debug("IP literal connect failed %s:%s — %s", address, port, e)
+        # fall through to getaddrinfo path
 
     infos4, infos6 = [], []
     try:
@@ -371,6 +372,7 @@ async def websocket_tunnel(ws: WebSocket, uuid: str):
             return
 
         command, address, port, payload = await parse_vless_header(first_chunk)
+        ver = first_chunk[0:1] if first_chunk else bytes([0])
 
         if not await check_and_use(uuid, len(first_chunk)):
             await ws.close(code=1008, reason="quota/disabled")
@@ -378,12 +380,24 @@ async def websocket_tunnel(ws: WebSocket, uuid: str):
 
         _M().stats["total_requests"] += 1
         _M().connections[conn_id]["bytes"] += len(first_chunk)
-        logger.info(f"➡️  [{conn_id}] → {address}:{port}")
+        logger.info(f"➡️  [{conn_id}] cmd={command} → {address}:{port}")
+
+        # command: 1 = TCP, 2 = UDP (DNS and similar)
+        if command == 2:
+            await _udp_tunnel(ws, address, port, payload, conn_id, uuid, ver)
+            asyncio.create_task(_M().save_state())
+            return
 
         reader, writer = await asyncio.wait_for(
             open_dual_stack(address, port, timeout=8.0),
             timeout=12.0,
         )
+
+        # CRITICAL: reply VLESS success immediately (version + addon_len=0)
+        try:
+            await ws.send_bytes(ver + bytes([0]))
+        except Exception:
+            await ws.send_bytes(bytes([0, 0]))
 
         if payload:
             writer.write(payload)
