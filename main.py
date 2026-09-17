@@ -5063,51 +5063,214 @@ def _sub_lines_for_link(uuid: str, link: dict, host: str) -> list[str]:
     return lines
 
 
+
+def _parse_vless_uri(uri: str) -> dict | None:
+    """Parse vless:// share link into fields for Clash / Sing-box."""
+    try:
+        from urllib.parse import urlparse, parse_qs, unquote
+        if not uri or not uri.startswith("vless://"):
+            return None
+        u = urlparse(uri)
+        uuid = unquote(u.username or "")
+        host = u.hostname or ""
+        port = int(u.port or 443)
+        q = {k: (v[0] if v else "") for k, v in parse_qs(u.query).items()}
+        name = unquote(u.fragment or "node")[:64] or "node"
+        network = (q.get("type") or q.get("net") or "ws").lower()
+        security = (q.get("security") or "tls").lower()
+        path = q.get("path") or "/"
+        sni = q.get("sni") or q.get("host") or host
+        fp = q.get("fp") or "chrome"
+        alpn = q.get("alpn") or ""
+        mode = q.get("mode") or ""
+        return {
+            "uuid": uuid,
+            "host": host,
+            "port": port,
+            "name": name,
+            "network": network,
+            "security": security,
+            "path": path,
+            "sni": sni,
+            "fp": fp,
+            "alpn": alpn,
+            "mode": mode,
+            "host_header": q.get("host") or host,
+            "uri": uri,
+        }
+    except Exception:
+        return None
+
+
 def format_sub_clash_yaml(lines: list[str], name: str = "AGN021G") -> str:
-    """Minimal Clash Meta proxy-providers style subscription (URI list as proxies via proxy-providers is complex).
-    Export as simple proxies list from vless links is limited; provide profile that points clients to use sub URL.
-    Fallback: list proxies as 'type: vless' when parseable, else deliver raw as comment + mixed-port profile.
-    """
-    # Clash cannot easily parse vless URI; give a workable minimal config with proxy names
+    """Clash Meta compatible YAML from vless share links."""
     proxies = []
+    names = []
     for i, line in enumerate(lines):
-        if not line.startswith("vless://"):
+        pr = _parse_vless_uri(line.strip())
+        if not pr:
             continue
-        # Keep simple: use external proxy via name only — many clients prefer base64 sub
-        # Emit as share-link style is not valid YAML clash; instead return proxy-providers file
-        proxies.append(f"  - name: node-{i+1}\n    type: vless\n    server: example.invalid\n    port: 443\n    uuid: 00000000-0000-0000-0000-000000000000\n    network: ws\n    tls: true\n    skip-cert-verify: true\n    # source: share link in RAW format preferred")
-    # Better approach for Clash: use proxy-providers with http type pointing is not portable.
-    # Deliver URI list as YAML comments + recommend RAW; or use clash.meta share conversion simple:
-    body = f"""# AGN021G Clash profile — prefer RAW/Base64 sub in most clients
-# For Clash Meta: use subscription type http with this panel's base64 URL
+        pname = pr["name"] or f"node-{i+1}"
+        base = pname
+        n = 1
+        while pname in names:
+            n += 1
+            pname = f"{base}-{n}"
+        names.append(pname)
+        net = pr["network"]
+        item = [
+            f"  - name: \"{pname}\"",
+            f"    type: vless",
+            f"    server: {pr['host']}",
+            f"    port: {pr['port']}",
+            f"    uuid: {pr['uuid']}",
+            f"    udp: true",
+            f"    tls: {'true' if pr['security'] in ('tls', 'reality') else 'false'}",
+            f"    skip-cert-verify: false",
+            f"    client-fingerprint: {pr['fp'] or 'chrome'}",
+            f"    servername: {pr['sni']}",
+        ]
+        if pr.get("alpn"):
+            alpn_list = [a.strip() for a in pr["alpn"].split(",") if a.strip()]
+            if alpn_list:
+                item.append("    alpn:")
+                for a in alpn_list:
+                    item.append(f"      - {a}")
+        if net in ("ws", "websocket"):
+            item.append("    network: ws")
+            item.append("    ws-opts:")
+            item.append(f"      path: \"{pr['path']}\"")
+            item.append("      headers:")
+            item.append(f"        Host: {pr['host_header']}")
+        elif net in ("xhttp", "splithttp", "httpupgrade", "http"):
+            item.append("    network: ws")
+            item.append("    ws-opts:")
+            item.append(f"      path: \"{pr['path']}\"")
+            item.append("      headers:")
+            item.append(f"        Host: {pr['host_header']}")
+            item.append(f"    # original-transport: {net} mode={pr.get('mode') or ''}")
+        else:
+            item.append(f"    network: {net}")
+        proxies.append("\n".join(item))
+
+    if not proxies:
+        return (
+            f"# {name} — no parseable vless links\n"
+            "proxies: []\n"
+            "proxy-groups: []\n"
+            "rules:\n  - MATCH,DIRECT\n"
+        )
+
+    proxy_block = "\n".join(proxies)
+    name_list = "\n".join(f"      - \"{n}\"" for n in names)
+    return f"""# AGN021G Clash Meta — {name}
 mixed-port: 7890
 allow-lan: false
 mode: rule
 log-level: info
-proxies: []
+ipv6: false
+
+proxies:
+{proxy_block}
+
 proxy-groups:
-  - name: PROXY
+  - name: "PROXY"
     type: select
     proxies:
+{name_list}
       - DIRECT
+
 rules:
+  - GEOIP,IR,DIRECT
   - MATCH,PROXY
 """
-    # Append share links as comments for manual import
-    comments = "\n".join(f"# {ln}" for ln in lines[:20])
-    return body + "\n" + comments + "\n"
 
 
 def format_sub_singbox_json(lines: list[str], name: str = "AGN021G") -> str:
-    """Sing-box outbound share is complex; provide JSON array of share links for clients that accept it."""
+    """Sing-box config JSON with vless outbounds."""
     import json as _json
-    return _json.dumps({"outbounds_share": lines, "remarks": name, "version": 1}, ensure_ascii=False, indent=2)
+    outbounds = []
+    tags = []
+    for i, line in enumerate(lines):
+        pr = _parse_vless_uri(line.strip())
+        if not pr:
+            continue
+        tag = (pr["name"] or f"node-{i+1}")[:48]
+        base = tag
+        n = 1
+        while tag in tags:
+            n += 1
+            tag = f"{base}-{n}"
+        tags.append(tag)
+        net = pr["network"]
+        transport = None
+        if net in ("ws", "websocket", "xhttp", "splithttp"):
+            transport = {
+                "type": "ws",
+                "path": pr["path"],
+                "headers": {"Host": pr["host_header"]},
+            }
+        ob = {
+            "type": "vless",
+            "tag": tag,
+            "server": pr["host"],
+            "server_port": pr["port"],
+            "uuid": pr["uuid"],
+        }
+        if pr["security"] in ("tls", "reality"):
+            tls = {
+                "enabled": True,
+                "server_name": pr["sni"],
+                "insecure": False,
+                "utls": {"enabled": True, "fingerprint": pr["fp"] or "chrome"},
+            }
+            if pr.get("alpn"):
+                tls["alpn"] = [a.strip() for a in pr["alpn"].split(",") if a.strip()]
+            ob["tls"] = tls
+        if transport:
+            ob["transport"] = transport
+        outbounds.append(ob)
+
+    selector = {
+        "type": "selector",
+        "tag": "proxy",
+        "outbounds": tags + ["direct"],
+        "default": tags[0] if tags else "direct",
+    }
+    direct = {"type": "direct", "tag": "direct"}
+    block = {"type": "block", "tag": "block"}
+    cfg = {
+        "log": {"level": "info"},
+        "outbounds": outbounds + [selector, direct, block],
+        "remarks": name,
+    }
+    return _json.dumps(cfg, ensure_ascii=False, indent=2)
 
 
 def format_sub_v2rayn_json(lines: list[str], name: str = "AGN021G") -> str:
     import json as _json
-    # v2rayN sometimes accepts list of share links
-    return _json.dumps({"index": 0, "items": [{"remarks": name, "url": ln} for ln in lines]}, ensure_ascii=False, indent=2)
+    return _json.dumps(
+        {"remarks": name, "count": len(lines), "servers": lines},
+        ensure_ascii=False,
+        indent=2,
+    )
+
+
+def render_subscription_body(lines: list[str], fmt: str, name: str = "AGN021G") -> tuple:
+    """Return (body, media_type, filename) for fmt: raw|base64|clash|singbox|v2rayn."""
+    fmt = (fmt or "base64").strip().lower()
+    raw_text = "\n".join(lines)
+    if fmt in ("raw", "text", "uri", "plain", "txt"):
+        return raw_text + ("\n" if raw_text else ""), "text/plain; charset=utf-8", "subscription.txt"
+    if fmt in ("clash", "yaml", "yml", "meta"):
+        return format_sub_clash_yaml(lines, name), "text/yaml; charset=utf-8", "clash.yaml"
+    if fmt in ("singbox", "sing-box", "sb", "sfa"):
+        return format_sub_singbox_json(lines, name), "application/json; charset=utf-8", "singbox.json"
+    if fmt in ("v2rayn", "v2rayN", "json"):
+        return format_sub_v2rayn_json(lines, name), "application/json; charset=utf-8", "v2rayn.json"
+    b64 = base64.b64encode(raw_text.encode("utf-8")).decode("ascii")
+    return b64, "text/plain; charset=utf-8", "subscription.txt"
+
 
 
 @app.get("/sub/{uuid}")
@@ -6457,15 +6620,8 @@ async def sub_group_subscription(
                     )
                 )
 
-    content = (
-        base64
-        .b64encode(
-            "\n".join(
-                lines
-            ).encode()
-        )
-        .decode()
-    )
+    fmt = (request.query_params.get("format") or request.query_params.get("fmt") or "base64").strip().lower()
+    content, sub_media, sub_fname = render_subscription_body(lines, fmt, str(sub.get("name") or "AGN021G"))
 
     total_used = 0
     total_limit = 0
@@ -6513,9 +6669,10 @@ async def sub_group_subscription(
         group_title,
     )
 
+    headers["Content-Disposition"] = f'inline; filename="{sub_fname}"'
     return Response(
         content=content,
-        media_type="text/plain; charset=utf-8",
+        media_type=sub_media,
         headers=headers,
     )
 
@@ -6765,7 +6922,7 @@ img,canvas,svg{max-width:100%;height:auto}
 <div class="toast" id="toast">کپی شد</div>
 <script>
 const subUrl = location.origin + location.pathname + location.search;
-document.getElementById('subUrl').textContent = subUrl;
+document.getElementById('subUrl').textContent = subUrl; try{wireFmtDownloads()}catch(e){}
 const key = location.pathname.split('/').filter(Boolean).pop();
 
 function toast(m){
@@ -6778,6 +6935,26 @@ async function copySub(){
     if(navigator.clipboard&&window.isSecureContext) await navigator.clipboard.writeText(subUrl);
     else{const a=document.createElement('textarea');a.value=subUrl;document.body.appendChild(a);a.select();document.execCommand('copy');a.remove()}
     toast('لینک کپی شد ✓');
+  }catch(e){toast('کپی نشد')}
+}
+function fmtUrl(fmt){
+  if(!subUrl) return '#';
+  const u=subUrl+(subUrl.indexOf('?')>=0?'&':'?')+'format='+encodeURIComponent(fmt);
+  return u;
+}
+function wireFmtDownloads(){
+  const map={dlBase64:'base64',dlRaw:'raw',dlClash:'clash',dlSing:'sing-box'};
+  Object.keys(map).forEach(function(id){
+    const el=document.getElementById(id);
+    if(el) el.href=fmtUrl(map[id]);
+  });
+}
+async function copyFmt(fmt){
+  const u=fmtUrl(fmt);
+  try{
+    if(navigator.clipboard&&window.isSecureContext) await navigator.clipboard.writeText(u);
+    else{const a=document.createElement('textarea');a.value=u;document.body.appendChild(a);a.select();document.execCommand('copy');a.remove()}
+    toast('لینک '+fmt+' کپی شد');
   }catch(e){toast('کپی نشد')}
 }
 function showOs(os){
