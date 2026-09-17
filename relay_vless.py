@@ -169,7 +169,8 @@ async def relay_ws_to_tcp(ws: WebSocket, writer: asyncio.StreamWriter, conn_id: 
             _M().stats["total_requests"] += 1
             _M().connections[conn_id]["bytes"] += len(data)
             writer.write(data)
-            if writer.transport.get_write_buffer_size() > RELAY_BUF:
+            # drain sooner so pages/streams don't stall mid-load
+            if writer.transport.get_write_buffer_size() > (256 * 1024):
                 await writer.drain()
     except (WebSocketDisconnect, Exception):
         pass
@@ -203,33 +204,53 @@ async def relay_tcp_to_ws(ws: WebSocket, reader: asyncio.StreamReader, conn_id: 
         await gate.flush()
 
 
-async def open_dual_stack(address: str, port: int, timeout: float = 12.0):
-    """Connect with IPv4/IPv6 + TCP_NODELAY/keepalive + large buffers for max throughput."""
+async def open_dual_stack(address: str, port: int, timeout: float = 10.0):
+    """Connect outbound: IPv4 first by default, then IPv6. TCP_NODELAY + large buffers."""
     import socket
 
-    prefer_v6 = True
+    # Default IPv4 priority — IPv6 only if prefer_ipv6=True in settings
+    prefer_v6 = False
     try:
-        NETWORK_CFG = _M().NETWORK_CFG
-        prefer_v6 = bool(NETWORK_CFG.get("prefer_ipv6", False))
+        prefer_v6 = bool(_M().NETWORK_CFG.get("prefer_ipv6", False))
+    except Exception:
+        prefer_v6 = False
+
+    loop = asyncio.get_running_loop()
+    infos4, infos6 = [], []
+    try:
+        infos4 = await loop.getaddrinfo(address, port, type=socket.SOCK_STREAM, family=socket.AF_INET)
     except Exception:
         pass
-    loop = asyncio.get_running_loop()
-    infos = await loop.getaddrinfo(address, port, type=socket.SOCK_STREAM)
-    if not infos:
+    try:
+        infos6 = await loop.getaddrinfo(address, port, type=socket.SOCK_STREAM, family=socket.AF_INET6)
+    except Exception:
+        pass
+    # dedupe while preserving order
+    seen = set()
+    ordered = []
+    sequence = (infos6 + infos4) if prefer_v6 else (infos4 + infos6)
+    if not sequence:
+        # last resort: any family
+        sequence = await loop.getaddrinfo(address, port, type=socket.SOCK_STREAM)
+    for info in sequence:
+        sockaddr = info[4]
+        key = (sockaddr[0], sockaddr[1] if len(sockaddr) > 1 else port)
+        if key in seen:
+            continue
+        seen.add(key)
+        ordered.append(info)
+    if not ordered:
         raise OSError(f"resolve failed: {address}")
 
-    def key(info):
-        family = info[0]
-        is_v6 = 1 if family == socket.AF_INET6 else 0
-        return (-is_v6) if prefer_v6 else (is_v6)
-
-    infos = sorted(infos, key=key)
+    per_try = min(4.0, max(2.0, float(timeout) / max(1, len(ordered))))
     last_err = None
-    for family, type_, proto, canon, sockaddr in infos:
+    for family, type_, proto, canon, sockaddr in ordered:
+        host_ip = sockaddr[0]
+        # skip pure IPv6 when we want IPv4 priority and we still have v4 left? already ordered
         try:
             reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(sockaddr[0], sockaddr[1]),
-                timeout=timeout,
+                asyncio.open_connection(host_ip, sockaddr[1]),
+                timeout=per_try,
             )
             sock = writer.get_extra_info("socket")
             if sock is not None:
@@ -337,8 +358,8 @@ async def websocket_tunnel(ws: WebSocket, uuid: str):
         logger.info(f"➡️  [{conn_id}] → {address}:{port}")
 
         reader, writer = await asyncio.wait_for(
-            open_dual_stack(address, port),
-            timeout=10.0,
+            open_dual_stack(address, port, timeout=8.0),
+            timeout=12.0,
         )
 
         if payload:

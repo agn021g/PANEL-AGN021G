@@ -351,13 +351,13 @@ PROTOCOL_LABELS = {
     "xhttp-packet-up": "XHTTP Packet Up",
     "xhttp-stream-up": "XHTTP Stream Up",
     "xhttp-stream-one": "XHTTP Stream One",
-    "vmess-ws": "VMess WebSocket",
-    "trojan-ws": "Trojan WebSocket",
-    "shadowsocks": "Shadowsocks",
-    "socks5": "SOCKS5",
-    "http": "HTTP Proxy",
-    "hysteria2": "Hysteria 2",
-    "tuic": "TUIC",
+    "vmess-ws": "VMess WS (نیاز به سرور جدا)",
+    "trojan-ws": "Trojan WS (نیاز به سرور جدا)",
+    "shadowsocks": "Shadowsocks (نیاز به سرور جدا)",
+    "socks5": "SOCKS5 (نیاز به سرور جدا)",
+    "http": "HTTP (نیاز به سرور جدا)",
+    "hysteria2": "Hysteria2 (نیاز به UDP)",
+    "tuic": "TUIC (نیاز به UDP)",
     "wireguard": "WireGuard (WARP)",
     "highspeed-demo": "HighSpeed Upload/Download (دمو)",
     "gaming-lite-demo": "Gaming Lite (دمو)",
@@ -371,6 +371,16 @@ PROTOCOL_ALIASES = {
 }
 
 DEFAULT_PROTOCOL = "vless-ws"
+
+# Real tunnel on this panel (others need external server / UDP / WARP conf)
+WORKING_RELAY_PROTOCOLS = frozenset({
+    "vless-ws",
+    "xhttp-packet-up",
+    "xhttp-stream-up",
+    "xhttp-stream-one",
+})
+WARP_CONF_PROTOCOLS = frozenset({"wireguard", "amnezia-wg"})
+
 
 FINGERPRINTS = (
     "chrome",
@@ -395,6 +405,10 @@ DEFAULT_ALPN_BY_PROTOCOL = {
 }
 
 DEFAULT_PORT = 443
+
+# DNS داخل تونل (کاهش نشت DNS روی کلاینت‌هایی که از DNS کانفیگ استفاده می‌کنند)
+CLIENT_DNS_SERVERS = "1.1.1.1, 8.8.8.8"
+
 
 # Public endpoint for configs (Railway domain or TCP Proxy host:port)
 # Env: PUBLIC_HOST, PUBLIC_PORT, PUBLIC_SECURITY=tls|none
@@ -425,7 +439,7 @@ NETWORK_CFG = {
     "public_host": (os.environ.get("PUBLIC_HOST") or "").strip(),
     "public_port": int(os.environ.get("PUBLIC_PORT") or 0) or 0,
     "public_security": (os.environ.get("PUBLIC_SECURITY") or "tls").strip().lower(),  # tls | none
-    "prefer_ipv6": str(os.environ.get("PREFER_IPV6") or "0").strip().lower() in ("1", "true", "yes"),
+    "prefer_ipv6": str(os.environ.get("PREFER_IPV6") or "0").strip().lower() in ("1", "true", "yes"),  # default IPv4 first
 }
 
 MIN_PORT = 1
@@ -804,7 +818,7 @@ def build_wireguard_conf(link: dict, host: str, amnezia: bool = False) -> str:
     priv = link.get("wg_private") or ""
     peer = link.get("wg_peer_public") or link.get("wg_public") or ""
     addr = link.get("wg_address") or "10.66.66.2/32"
-    dns = link.get("wg_dns") or "1.1.1.1, 1.0.0.1"
+    dns = link.get("wg_dns") or CLIENT_DNS_SERVERS
     mtu = int(link.get("wg_mtu") or 1280)
     endpoint_host = (link.get("endpoint_host") or host or "").strip()
     endpoint_port = int(link.get("wg_port") or link.get("port") or 51820)
@@ -1609,13 +1623,6 @@ def generate_vless_link(
     host_url = host
     if ":" in host and not host.startswith("["):
         host_url = f"[{host}]"
-    # Protocols without a real server on this host → emit working VLESS-WS URI
-    # (WireGuard/Amnezia use WARP conf separately; still map URI for v2ray sub compatibility)
-    _FAKE = {"vmess-ws", "trojan-ws", "shadowsocks", "socks5", "http", "hysteria2", "tuic", "gaming-lite-demo", "wireguard", "amnezia-wg"}
-    if protocol in _FAKE and protocol not in ("wireguard", "amnezia-wg"):
-        protocol = "vless-ws"
-        if not alpn_value:
-            alpn_value = DEFAULT_ALPN_BY_PROTOCOL.get("vless-ws", "http/1.1")
     if protocol == "vless-ws":
         q = {
             "encryption": "none",
@@ -2315,7 +2322,7 @@ async def make_link(
             record["wg_public"] = pub
             record["wg_peer_public"] = server_pub
             record["wg_address"] = "10.66.66.2/32"
-            record["wg_dns"] = "1.1.1.1, 1.0.0.1"
+            record["wg_dns"] = CLIENT_DNS_SERVERS
             record["wg_mtu"] = 1280
             record["wg_port"] = 51820
             record["wg_allowed"] = "0.0.0.0/0, ::/0"
@@ -4090,7 +4097,14 @@ async def create_multi_auto_link(request: Request, _=Depends(require_auth)):
 
     created = []
     total = 0
+    skipped_protocols = []
     for protocol, n in counts.items():
+        # only real relay protocols enter the VLESS/XHTTP subscription lines
+        if protocol not in WORKING_RELAY_PROTOCOLS:
+            if protocol in WARP_CONF_PROTOCOLS:
+                continue  # already handled as WARP conf above
+            skipped_protocols.append(protocol)
+            continue
         for i in range(n):
             for ep_tag, ep_host, ep_port, ep_sec in endpoints:
                 base_lab = PROTOCOL_LABELS.get(protocol, protocol).split()[0]
@@ -4137,6 +4151,7 @@ async def create_multi_auto_link(request: Request, _=Depends(require_auth)):
         "page": page_url,
         "sub": sub_url,
         "amnezia_count": len(sub.get("amnezia_configs") or []),
+        "skipped_protocols": skipped_protocols,
         "count": total,
         "protocols": counts,
         "links": created,
@@ -6735,14 +6750,34 @@ function drawUsageChart(links){
           +'<div class="desc" style="font-size:11px;color:var(--t3)">'+meta+'</div>'
           +'<div class="desc" style="font-size:10px;direction:ltr;color:var(--t3)">'+(c.endpoint||'')+'</div>'
           +'<button type="button" class="btn btn-p awg-copy" style="width:100%" data-conf="'+encodeURIComponent(conf)+'">کپی کانفیگ</button>'
-          +'<a class="btn" style="text-align:center;text-decoration:none;background:rgba(255,255,255,.08);color:#e2e8f0;border:1px solid var(--border)" href="/api/public/amnezia/'+key+'/'+eid+'" download>دانلود .conf</a></div>';
+          +'<button type="button" class="btn awg-dl" style="width:100%;background:rgba(255,255,255,.08);color:#e2e8f0;border:1px solid var(--border)" data-conf="'+encodeURIComponent(conf)+'" data-name="'+encodeURIComponent((c.profile||c.type||"amnezia")+'-'+(c.id||"cfg"))+'">دانلود فایل .conf</button></div>';
       }).join('');
+      function awgSaveFile(confText, fname){
+        try{
+          const blob=new Blob([confText],{type:'application/octet-stream'});
+          const url=URL.createObjectURL(blob);
+          const a=document.createElement('a');
+          a.href=url;
+          a.download=(fname||'amnezia')+'.conf';
+          document.body.appendChild(a);
+          a.click();
+          setTimeout(function(){try{URL.revokeObjectURL(url);a.remove()}catch(e){}},500);
+          toast('دانلود شروع شد');
+        }catch(e){toast('دانلود نشد — از کپی استفاده کنید')}
+      }
       alist.querySelectorAll('.awg-copy').forEach(function(btn){
         btn.onclick=async function(){
           try{
             await navigator.clipboard.writeText(decodeURIComponent(btn.dataset.conf||''));
             toast('کانفیگ کپی شد');
           }catch(e){toast('کپی نشد')}
+        };
+      });
+      alist.querySelectorAll('.awg-dl').forEach(function(btn){
+        btn.onclick=function(){
+          const confText=decodeURIComponent(btn.dataset.conf||'');
+          let fname=decodeURIComponent(btn.dataset.name||'amnezia').replace(/[^a-zA-Z0-9_-]/g,'-')||'amnezia';
+          awgSaveFile(confText, fname);
         };
       });
     }
@@ -8127,11 +8162,19 @@ async def public_amnezia_download(uuid_key: str, cfg_id: str):
     item = next((x for x in (sub.get("amnezia_configs") or []) if str(x.get("id")) == str(cfg_id)), None)
     if not item or not item.get("conf"):
         raise HTTPException(404, detail="config not found")
-    from fastapi.responses import PlainTextResponse
-    return PlainTextResponse(
-        item["conf"],
-        media_type="text/plain; charset=utf-8",
-        headers={"Content-Disposition": f'attachment; filename="{item.get("name") or "amnezia"}.conf"'},
+    from fastapi.responses import Response
+    # ASCII-only filename — Persian/special chars break some browsers
+    safe_name = "".join(ch if (ch.isascii() and (ch.isalnum() or ch in "-_")) else "-" for ch in str(item.get("name") or "amnezia"))
+    safe_name = (safe_name.strip("-") or "amnezia")[:40] + ".conf"
+    body = str(item["conf"]).encode("utf-8")
+    return Response(
+        content=body,
+        media_type="application/octet-stream",
+        headers={
+            "Content-Disposition": f'attachment; filename="{safe_name}"',
+            "Content-Length": str(len(body)),
+            "Cache-Control": "no-store",
+        },
     )
 
 
@@ -9857,7 +9900,7 @@ async function doAutoCreate(){
 function fillMultiProtoList(){
   const box=document.getElementById('aProtoList');
   if(!box)return;
-  const preferred=['vless-ws','xhttp-packet-up','xhttp-stream-up','xhttp-stream-one','vmess-ws','trojan-ws','shadowsocks','socks5','http','hysteria2','tuic','wireguard','highspeed-demo','gaming-lite-demo'];
+  const preferred=['vless-ws','xhttp-packet-up','xhttp-stream-up','xhttp-stream-one','wireguard'];
   const labels={
     'vless-ws':'VLESS WebSocket','xhttp-packet-up':'XHTTP Packet Up','xhttp-stream-up':'XHTTP Stream Up','xhttp-stream-one':'XHTTP Stream One',
     'vmess-ws':'VMess WebSocket','trojan-ws':'Trojan WebSocket','shadowsocks':'Shadowsocks','socks5':'SOCKS5','http':'HTTP Proxy',
