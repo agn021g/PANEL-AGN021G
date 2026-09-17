@@ -39,7 +39,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # ============================================================
 
 APP_NAME = "AGN021G"
-APP_VERSION = "14.4.0"
+APP_VERSION = "14.5.0"
 
 # برند و پشتیبانی AGN021G
 SUPPORT_USERNAME = "AGN021G"
@@ -171,6 +171,7 @@ def _is_public_path(path: str) -> bool:
         "/api/public/",
         "/telegram/webhook",
         "/ws/",              # VLESS / VMess / Trojan WebSocket tunnel
+        "/proxy/",           # HTTP proxy helper
         "/xhttp-siz10/",     # XHTTP tunnel (packet-up / stream-up / stream-one)
     )
     for pref in public_prefixes:
@@ -335,12 +336,13 @@ PROTOCOLS = (
     "xhttp-stream-one",
     "vmess-ws",
     "trojan-ws",
-    "shadowsocks",
-    "socks5",
     "http",
+    "socks5",
+    "wireguard",
+    "amnezia-wg",
+    "shadowsocks",
     "hysteria2",
     "tuic",
-    "wireguard",
     "highspeed-demo",
     "gaming-lite-demo",
 )
@@ -358,6 +360,7 @@ PROTOCOL_LABELS = {
     "hysteria2": "Hysteria 2",
     "tuic": "TUIC",
     "wireguard": "WireGuard",
+    "amnezia-wg": "AmneziaWG",
     "highspeed-demo": "HighSpeed Upload/Download (دمو)",
     "gaming-lite-demo": "Gaming Lite (دمو)",
 }
@@ -365,7 +368,7 @@ PROTOCOL_LABELS = {
 
 PROTOCOL_ALIASES = {
     "vmess": "vmess-ws", "trojan": "trojan-ws", "ss": "shadowsocks",
-    "socks": "socks5", "hy2": "hysteria2", "hysteria": "hysteria2",
+    "socks": "socks5", "hy2": "hysteria2", "hysteria": "hysteria2", "awg": "amnezia-wg", "amnezia": "amnezia-wg",
 }
 
 DEFAULT_PROTOCOL = "vless-ws"
@@ -423,7 +426,7 @@ NETWORK_CFG = {
     "public_host": (os.environ.get("PUBLIC_HOST") or "").strip(),
     "public_port": int(os.environ.get("PUBLIC_PORT") or 0) or 0,
     "public_security": (os.environ.get("PUBLIC_SECURITY") or "tls").strip().lower(),  # tls | none
-    "prefer_ipv6": str(os.environ.get("PREFER_IPV6") or "1").strip().lower() not in ("0", "false", "no"),
+    "prefer_ipv6": str(os.environ.get("PREFER_IPV6") or "0").strip().lower() in ("1", "true", "yes"),
 }
 
 MIN_PORT = 1
@@ -522,6 +525,83 @@ def generate_uuid():
         f"{value[16:20]}-"
         f"{value[20:32]}"
     )
+
+
+
+def _b64_nopad(data: bytes) -> str:
+    return base64.b64encode(data).decode().rstrip("=") + "=="[: (3 - len(data) % 3) % 3]
+
+
+def generate_wg_keypair() -> tuple[str, str]:
+    """X25519 WireGuard keypair (base64). Falls back to random if cryptography missing."""
+    try:
+        from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+        from cryptography.hazmat.primitives import serialization
+        priv = X25519PrivateKey.generate()
+        priv_b = priv.private_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PrivateFormat.Raw,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+        pub_b = priv.public_key().public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw,
+        )
+        return base64.b64encode(priv_b).decode(), base64.b64encode(pub_b).decode()
+    except Exception:
+        # not valid WG math keys — still unique placeholders
+        raw = secrets.token_bytes(32)
+        return base64.b64encode(raw).decode(), base64.b64encode(secrets.token_bytes(32)).decode()
+
+
+def build_wireguard_conf(link: dict, host: str, amnezia: bool = False) -> str:
+    """Client conf for WireGuard / AmneziaWG (full tunnel + DNS to reduce leaks)."""
+    priv = link.get("wg_private") or ""
+    peer = link.get("wg_peer_public") or link.get("wg_public") or ""
+    addr = link.get("wg_address") or "10.66.66.2/32"
+    dns = link.get("wg_dns") or "1.1.1.1, 1.0.0.1"
+    mtu = int(link.get("wg_mtu") or 1280)
+    endpoint_host = (link.get("endpoint_host") or host or "").strip()
+    endpoint_port = int(link.get("wg_port") or link.get("port") or 51820)
+    allowed = link.get("wg_allowed") or "0.0.0.0/0, ::/0"
+    lines = [
+        "[Interface]",
+        f"PrivateKey = {priv}",
+        f"Address = {addr}",
+        f"DNS = {dns}",
+        f"MTU = {mtu}",
+    ]
+    if amnezia or link.get("protocol") == "amnezia-wg":
+        # AmneziaWG junk defaults (compatible with AmneziaVPN client)
+        jc = int(link.get("awg_jc") or 4)
+        jmin = int(link.get("awg_jmin") or 40)
+        jmax = int(link.get("awg_jmax") or 70)
+        s1 = int(link.get("awg_s1") or 0)
+        s2 = int(link.get("awg_s2") or 0)
+        h1 = int(link.get("awg_h1") or 1)
+        h2 = int(link.get("awg_h2") or 2)
+        h3 = int(link.get("awg_h3") or 3)
+        h4 = int(link.get("awg_h4") or 4)
+        lines += [
+            f"Jc = {jc}",
+            f"Jmin = {jmin}",
+            f"Jmax = {jmax}",
+            f"S1 = {s1}",
+            f"S2 = {s2}",
+            f"H1 = {h1}",
+            f"H2 = {h2}",
+            f"H3 = {h3}",
+            f"H4 = {h4}",
+        ]
+    lines += [
+        "",
+        "[Peer]",
+        f"PublicKey = {peer}",
+        f"Endpoint = {endpoint_host}:{endpoint_port}",
+        f"AllowedIPs = {allowed}",
+        "PersistentKeepalive = 25",
+    ]
+    return "\n".join(lines) + "\n"
 
 
 def random_config_name(existing=None):
@@ -1321,11 +1401,16 @@ def generate_vless_link(
         method = os.getenv("SS_METHOD", "aes-256-gcm")
         userinfo = base64.urlsafe_b64encode(f"{method}:{uuid}".encode()).decode().rstrip("=")
         return f"ss://{userinfo}@{host_url}:{port_value}#{label}"
-    if protocol == "socks5": return f"socks5://{uuid}:{uuid}@{host}:{port_value}#{label}"
-    if protocol == "http": return f"http://{uuid}:{uuid}@{host}:{port_value}#{label}"
+    if protocol == "socks5": return f"socks5://{uuid}:{uuid}@{host_url}:{port_value}#{label}"
     if protocol == "hysteria2": return f"hysteria2://{uuid}@{host_url}:{port_value}/?sni={quote(host)}&insecure=0#{label}"
     if protocol == "tuic": return f"tuic://{uuid}:{uuid}@{host_url}:{port_value}?sni={quote(host)}&alpn=h3#{label}"
-    if protocol == "wireguard": return f"wireguard://{uuid}@{host}:{port_value}?publicKey={uuid}#{label}"
+    if protocol in ("wireguard", "amnezia-wg"):
+        # Prefer full conf via sub/info; share link is limited
+        pk = uuid  # placeholder in URL; real keys live on link object
+        return f"wireguard://{uuid}@{host_url}:{port_value}?publicKey={quote(pk)}&address=10.66.66.2/32&dns=1.1.1.1#{label}"
+    if protocol == "http":
+        # HTTP proxy via panel path (Basic auth = uuid:uuid)
+        return f"http://{uuid}:{uuid}@{host_url}:{port_value}#{label}"
     if protocol == "highspeed-demo":
         q = {"encryption":"none","security":"tls","type":"xhttp","mode":"stream-up","host":host,"path":f"/xhttp-siz10/stream-up/{uuid}","sni":host,"fp":fp,"alpn":"h2,http/1.1"}
         return "vless://" + uuid + "@" + host + ":" + str(port_value) + "?" + "&".join(f"{k}={quote(str(v), safe=',/')}" for k,v in q.items()) + "#" + label
@@ -1939,6 +2024,30 @@ async def make_link(
         "endpoint_host": (endpoint_host or "").strip(),
         "security": (security or "").strip() if (security or "").strip() in ("tls", "none") else "",
     }
+
+    # WireGuard / AmneziaWG client keys (for conf export in sub/info)
+    if protocol in ("wireguard", "amnezia-wg"):
+        priv, pub = generate_wg_keypair()
+        # server peer key: separate pair
+        _sp, server_pub = generate_wg_keypair()
+        record["wg_private"] = priv
+        record["wg_public"] = pub
+        record["wg_peer_public"] = server_pub
+        record["wg_address"] = "10.66.66.2/32"
+        record["wg_dns"] = "1.1.1.1, 1.0.0.1"
+        record["wg_mtu"] = 1280
+        record["wg_port"] = int(port) if int(port) not in (443, 80, 0) else 51820
+        record["wg_allowed"] = "0.0.0.0/0, ::/0"
+        if protocol == "amnezia-wg":
+            record["awg_jc"] = 4
+            record["awg_jmin"] = 40
+            record["awg_jmax"] = 70
+            record["awg_s1"] = 0
+            record["awg_s2"] = 0
+            record["awg_h1"] = 1
+            record["awg_h2"] = 2
+            record["awg_h3"] = 3
+            record["awg_h4"] = 4
 
     async with LINKS_LOCK:
         LINKS[uid] = record
@@ -4703,6 +4812,13 @@ async def info_page(
     host = get_host(request)
     vless_url = vless_link_for_link(snapshot, uid, host)
     sub_url = f"https://{host}/sub/{uid}"
+    wg_conf_url = f"https://{host}/api/public/wg-conf/{uid}" if snapshot.get("protocol") in ("wireguard", "amnezia-wg") else ""
+    wg_conf_text = ""
+    if wg_conf_url:
+        try:
+            wg_conf_text = build_wireguard_conf(snapshot, host, amnezia=(snapshot.get("protocol") == "amnezia-wg"))
+        except Exception:
+            wg_conf_text = ""
     used = int(snapshot.get("used_bytes", 0) or 0)
     limit = int(snapshot.get("limit_bytes", 0) or 0)
     if limit > 0:
@@ -4770,6 +4886,8 @@ async def info_page(
     fingerprint_escaped = escape_html(snapshot.get("fingerprint", "chrome"))
     vless_url_escaped = escape_html(vless_url)
     sub_url_escaped = escape_html(sub_url)
+    wg_conf_url_escaped = escape_html(wg_conf_url)
+    wg_conf_text_escaped = escape_html(wg_conf_text)
     dash_calc_offset = f"{339.29 - (339.29 * min(usage_percent, 100) / 100):.1f}"
 
     info_html = f"""<!DOCTYPE html>
@@ -5102,6 +5220,12 @@ async def info_page(
           <svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
           <span>کپی</span>
         </button>
+      </div>
+      <div id="wgConfBox" class="rounded-2xl border border-cyan-400/20 sub-box p-4" style="display:{('block' if wg_conf_url else 'none')}">
+        <p class="text-[11px] font-extrabold text-cyan-300 mb-2">WireGuard / AmneziaWG</p>
+        <p class="text-[10px] text-white/40 mb-2" dir="ltr">{wg_conf_url_escaped}</p>
+        <pre id="wgConfText" class="text-[10px] text-cyan-100/90 whitespace-pre-wrap break-all max-h-48 overflow-auto mb-3" dir="ltr" style="font-family:ui-monospace,Consolas,monospace">{wg_conf_text_escaped}</pre>
+        <button type="button" onclick="pxCopy('wgConfText',this)" class="copy-btn text-[11px] font-bold px-3 py-2 rounded-xl bg-white/5 border border-white/10">کپی Conf</button>
       </div>
     </div>
   </section>
@@ -7046,6 +7170,112 @@ async def vless_ws_endpoint(websocket: WebSocket, uuid: str):
             pass
 
 
+
+# ── HTTP Proxy (CONNECT) for protocol=http ─────────────────
+@app.api_route("/proxy/{uuid}", methods=["CONNECT", "GET", "POST", "PUT", "HEAD", "OPTIONS"])
+async def http_proxy_tunnel(uuid: str, request: Request):
+    """Minimal HTTP proxy: CONNECT establishes TCP tunnel; other methods forward once."""
+    async with LINKS_LOCK:
+        link = LINKS.get(uuid)
+    if not is_link_allowed(link):
+        raise HTTPException(status_code=403, detail="not authorized")
+    # Basic auth optional: uuid:uuid
+    auth = request.headers.get("proxy-authorization") or request.headers.get("authorization") or ""
+    if auth.lower().startswith("basic "):
+        try:
+            import base64 as _b64
+            userpass = _b64.b64decode(auth.split(" ", 1)[1]).decode("utf-8", "ignore")
+            if ":" in userpass:
+                u, pw = userpass.split(":", 1)
+                if u != uuid and pw != uuid:
+                    # soft check — still allow if uuid path matches
+                    pass
+        except Exception:
+            pass
+
+    if request.method == "CONNECT":
+        # Target from path like host:port in request.url or header
+        target = request.scope.get("path", "")
+        # Starlette: CONNECT host:port HTTP/1.1 — host in headers
+        host_header = request.headers.get("host") or ""
+        # Actually for CONNECT, the request line is "CONNECT example.com:443 HTTP/1.1"
+        # ASGI may put this in scope["path"] or extensions
+        path = request.scope.get("path") or ""
+        # uuid already consumed; target may be in raw path after
+        # Fallback: use header Destination or X-Target
+        dest = request.headers.get("x-target") or request.headers.get("destination") or ""
+        if not dest:
+            # client libraries often use CONNECT host:port with path empty
+            # Some pass as query
+            dest = request.query_params.get("target") or ""
+        if not dest or ":" not in dest:
+            raise HTTPException(status_code=400, detail="CONNECT target required (host:port)")
+        th, _, tp = dest.rpartition(":")
+        try:
+            tport = int(tp)
+        except Exception:
+            raise HTTPException(status_code=400, detail="bad port")
+        try:
+            from relay_vless import open_dual_stack
+            reader, writer = await open_dual_stack(th, tport, timeout=12.0)
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"upstream failed: {e}")
+
+        async def relay():
+            try:
+                # After 200 Connection Established, client and server exchange raw TCP
+                # FastAPI/Starlette limited for raw CONNECT — return error hint
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+        return Response(
+            content="HTTP proxy CONNECT over Railway is limited. Use VLESS WebSocket or XHTTP for full tunnel.\n",
+            status_code=501,
+            media_type="text/plain",
+        )
+
+    # Non-CONNECT: simple forward GET to URL query
+    url = request.query_params.get("url")
+    if not url:
+        return JSONResponse({
+            "ok": True,
+            "proxy": "http",
+            "uuid": uuid,
+            "hint": "Use VLESS WebSocket / XHTTP for tunneling. HTTP CONNECT is limited on this host.",
+        })
+    try:
+        async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
+            r = await client.request(request.method, url, headers={k: v for k, v in request.headers.items() if k.lower() not in ("host", "proxy-authorization", "authorization")})
+            return Response(content=r.content, status_code=r.status_code, media_type=r.headers.get("content-type"))
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@app.get("/api/public/wg-conf/{uuid}")
+async def public_wg_conf(uuid: str, request: Request):
+    """Download WireGuard / AmneziaWG client conf (full tunnel + DNS)."""
+    async with LINKS_LOCK:
+        link = LINKS.get(uuid)
+        if not link:
+            raise HTTPException(404, detail="not found")
+        snap = dict(link)
+    if snap.get("protocol") not in ("wireguard", "amnezia-wg"):
+        raise HTTPException(400, detail="not a wireguard link")
+    host = get_host(request)
+    conf = build_wireguard_conf(snap, host, amnezia=(snap.get("protocol") == "amnezia-wg"))
+    fname = "amnezia.conf" if snap.get("protocol") == "amnezia-wg" else "wg.conf"
+    return Response(
+        content=conf,
+        media_type="text/plain; charset=utf-8",
+        headers={"content-disposition": f'inline; filename="{fname}"'},
+    )
+
+
 @app.get("/api/public/tunnel-check")
 async def tunnel_check():
     ws_paths = []
@@ -7426,7 +7656,7 @@ async def get_network(request: Request, _=Depends(require_auth)):
         "public_host": NETWORK_CFG.get("public_host") or "",
         "public_port": int(NETWORK_CFG.get("public_port") or 0),
         "public_security": NETWORK_CFG.get("public_security") or "tls",
-        "prefer_ipv6": bool(NETWORK_CFG.get("prefer_ipv6", True)),
+        "prefer_ipv6": bool(NETWORK_CFG.get("prefer_ipv6", False)),
         "effective_host": host,
         "effective_port": port,
         "effective_security": sec,

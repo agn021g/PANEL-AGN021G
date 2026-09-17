@@ -210,7 +210,7 @@ async def open_dual_stack(address: str, port: int, timeout: float = 12.0):
     prefer_v6 = True
     try:
         NETWORK_CFG = _M().NETWORK_CFG
-        prefer_v6 = bool(NETWORK_CFG.get("prefer_ipv6", True))
+        prefer_v6 = bool(NETWORK_CFG.get("prefer_ipv6", False))
     except Exception:
         pass
     loop = asyncio.get_running_loop()
