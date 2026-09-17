@@ -3,7 +3,9 @@
 import asyncio
 import time
 
-from main import LINKS
+def _links():
+    import main as m
+    return m.LINKS
 
 _buckets: dict = {}
 
@@ -53,7 +55,7 @@ async def throttle(uuid: str, nbytes: int):
     """No-op when the link has no speed limit (the common case)."""
     if nbytes <= 0:
         return
-    link = LINKS.get(uuid)
+    link = _links().get(uuid)
     if not link:
         return
     rate = int(link.get("speed_limit_bytes") or 0)

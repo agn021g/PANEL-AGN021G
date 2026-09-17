@@ -16,7 +16,7 @@ def _M():
     import main as m
     return m
 
-from relay_vless import parse_vless_header, check_and_use, open_dual_stack
+from relay_vless import parse_vless_header, check_and_use
 try:
     from speed_limit import throttle
 except Exception:
@@ -307,7 +307,7 @@ def _downstream_gen(sess: dict):
 @router.get("/xhttp-siz10/{mode}/{uuid}/{session_id}")
 async def xhttp_downlink(mode: str, uuid: str, session_id: str, request: Request):
     ensure_reaper()
-    if mode not in ("packet-up", "stream-up"):
+    if mode not in ("packet-up", "stream-up", "stream-one"):
         raise HTTPException(status_code=404, detail="unknown mode")
     await _check_link(uuid)
     fp = request.query_params.get("fp", DEFAULT_FINGERPRINT)
@@ -337,7 +337,7 @@ async def packet_up_upload(uuid: str, session_id: str, seq: int, request: Reques
     await throttle(uuid, len(body))
 
     _M().stats["total_requests"] += 1
-    connections[sess["conn_id"]]["bytes"] += len(body)
+    _M().connections[sess["conn_id"]]["bytes"] += len(body)
 
     try:
         if sess["writer"] is None:
@@ -395,7 +395,7 @@ async def stream_up_upload(uuid: str, session_id: str, request: Request):
         flow = _AdaptiveFlow()
         sess["flow"] = flow
 
-    conn = connections[sess["conn_id"]]   # یک بار لوک‌آپ، نه هر چانک
+    conn = _M().connections[sess["conn_id"]]   # یک بار لوک‌آپ، نه هر چانک
     writer = sess["writer"]               # ممکنه هنوز None باشه
 
     try:
