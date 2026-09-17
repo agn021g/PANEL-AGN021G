@@ -339,7 +339,6 @@ PROTOCOLS = (
     "http",
     "socks5",
     "wireguard",
-    "amnezia-wg",
     "shadowsocks",
     "hysteria2",
     "tuic",
@@ -359,8 +358,7 @@ PROTOCOL_LABELS = {
     "http": "HTTP Proxy",
     "hysteria2": "Hysteria 2",
     "tuic": "TUIC",
-    "wireguard": "WireGuard",
-    "amnezia-wg": "AmneziaWG",
+    "wireguard": "WireGuard (WARP)",
     "highspeed-demo": "HighSpeed Upload/Download (دمو)",
     "gaming-lite-demo": "Gaming Lite (دمو)",
 }
@@ -368,7 +366,8 @@ PROTOCOL_LABELS = {
 
 PROTOCOL_ALIASES = {
     "vmess": "vmess-ws", "trojan": "trojan-ws", "ss": "shadowsocks",
-    "socks": "socks5", "hy2": "hysteria2", "hysteria": "hysteria2", "awg": "amnezia-wg", "amnezia": "amnezia-wg",
+    "socks": "socks5", "hy2": "hysteria2", "hysteria": "hysteria2",
+    "awg": "wireguard", "amnezia": "wireguard", "amnezia-wg": "wireguard",
 }
 
 DEFAULT_PROTOCOL = "vless-ws"
@@ -554,8 +553,154 @@ def generate_wg_keypair() -> tuple[str, str]:
         return base64.b64encode(raw).decode(), base64.b64encode(secrets.token_bytes(32)).decode()
 
 
+
+# Cloudflare WARP → AmneziaWG conf (same approach as public generators)
+WARP_AWG_ENDPOINTS = (
+    "https://warp.configwireguard.workers.dev/",
+    "https://warp.configwireguard2.workers.dev/",
+    "https://warp.configwireguard3.workers.dev/",
+    "https://warp.configwireguard4.workers.dev/",
+)
+
+
+async def fetch_warp_amnezia_conf(
+    endpoint: str | None = None,
+    mtu: int = 1280,
+    jc: int = 4,
+    jmin: int = 40,
+    jmax: int = 70,
+    label: str = "AmneziaWG",
+    amnezia: bool = True,
+) -> dict:
+    """Fetch Cloudflare WARP account and build WireGuard or AmneziaWG .conf.
+    Real tunnel via Cloudflare (not panel UDP). amnezia=False → plain WireGuard.
+    """
+    import random
+    endpoints = list(WARP_AWG_ENDPOINTS)
+    random.shuffle(endpoints)
+    raw_text = ""
+    last_err = None
+    client = globals().get("http_client")
+    for url in endpoints:
+        try:
+            if client is not None:
+                resp = await client.get(url, timeout=20.0)
+                if resp.status_code >= 400:
+                    continue
+                raw_text = resp.text
+            else:
+                import httpx
+                async with httpx.AsyncClient(timeout=20.0) as c:
+                    resp = await c.get(url)
+                    if resp.status_code >= 400:
+                        continue
+                    raw_text = resp.text
+            if raw_text and len(raw_text) > 40:
+                break
+        except Exception as e:
+            last_err = e
+            continue
+    if not raw_text:
+        return {"ok": False, "error": f"WARP API failed: {last_err or 'empty'}"}
+
+    config_text = raw_text
+    try:
+        import json as _json
+        parsed = _json.loads(raw_text)
+        if isinstance(parsed, dict) and parsed.get("config"):
+            config_text = parsed["config"]
+    except Exception:
+        pass
+
+    # parse simple WG conf
+    iface = {}
+    peer = {}
+    section = None
+    for line in config_text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1].lower()
+            continue
+        if "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        k, v = k.strip().lower(), v.strip()
+        if section == "interface":
+            iface[k] = v
+        elif section == "peer":
+            peer[k] = v
+
+    priv = iface.get("privatekey") or ""
+    addr = iface.get("address") or "172.16.0.2/32"
+    dns = iface.get("dns") or "1.1.1.1"
+    pub = peer.get("publickey") or ""
+    psk = peer.get("presharedkey") or ""
+    allowed = peer.get("allowedips") or "0.0.0.0/0, ::/0"
+    ep = (endpoint or peer.get("endpoint") or "").strip()
+    if not priv or not pub or not ep:
+        return {"ok": False, "error": "invalid WARP config payload"}
+
+    if jmax <= jmin:
+        jmax = jmin + 1
+    mtu = max(576, min(1500, int(mtu or 1280)))
+
+    kind = "AmneziaWG" if amnezia else "WireGuard"
+    lines = [
+        f"# {label} · {kind} (WARP/Cloudflare)",
+        "[Interface]",
+        f"PrivateKey = {priv}",
+        f"Address = {addr}",
+        f"DNS = {dns}",
+        f"MTU = {mtu}",
+    ]
+    if amnezia:
+        lines += [
+            f"Jc = {int(jc)}",
+            f"Jmin = {int(jmin)}",
+            f"Jmax = {int(jmax)}",
+            "S1 = 0",
+            "S2 = 0",
+            "H1 = 1",
+            "H2 = 2",
+            "H3 = 3",
+            "H4 = 4",
+        ]
+    lines += [
+        "",
+        "[Peer]",
+        f"PublicKey = {pub}",
+    ]
+    if psk:
+        lines.append(f"PresharedKey = {psk}")
+    lines += [
+        f"AllowedIPs = {allowed}",
+        f"Endpoint = {ep}",
+        "PersistentKeepalive = 25",
+    ]
+    conf = "\n".join(lines) + "\n"
+    return {
+        "ok": True,
+        "conf": conf,
+        "endpoint": ep,
+        "name": label,
+        "mtu": mtu,
+        "type": "amnezia" if amnezia else "wireguard",
+        "private_key": priv,
+        "public_key": pub,
+        "preshared_key": psk,
+        "address": addr,
+        "dns": dns,
+        "allowed_ips": allowed,
+    }
+
+
+
 def build_wireguard_conf(link: dict, host: str, amnezia: bool = False) -> str:
     """Client conf for WireGuard / AmneziaWG (full tunnel + DNS to reduce leaks)."""
+    if link.get("wg_conf"):
+        return str(link["wg_conf"])
     priv = link.get("wg_private") or ""
     peer = link.get("wg_peer_public") or link.get("wg_public") or ""
     addr = link.get("wg_address") or "10.66.66.2/32"
@@ -1364,6 +1509,13 @@ def generate_vless_link(
     host_url = host
     if ":" in host and not host.startswith("["):
         host_url = f"[{host}]"
+    # Protocols without a real server on this host → emit working VLESS-WS URI
+    # (WireGuard/Amnezia use WARP conf separately; still map URI for v2ray sub compatibility)
+    _FAKE = {"vmess-ws", "trojan-ws", "shadowsocks", "socks5", "http", "hysteria2", "tuic", "gaming-lite-demo", "wireguard", "amnezia-wg"}
+    if protocol in _FAKE and protocol not in ("wireguard", "amnezia-wg"):
+        protocol = "vless-ws"
+        if not alpn_value:
+            alpn_value = DEFAULT_ALPN_BY_PROTOCOL.get("vless-ws", "http/1.1")
     if protocol == "vless-ws":
         q = {
             "encryption": "none",
@@ -2025,29 +2177,48 @@ async def make_link(
         "security": (security or "").strip() if (security or "").strip() in ("tls", "none") else "",
     }
 
-    # WireGuard / AmneziaWG client keys (for conf export in sub/info)
+    # WireGuard → real Cloudflare WARP credentials (works in WG / Amnezia clients)
     if protocol in ("wireguard", "amnezia-wg"):
-        priv, pub = generate_wg_keypair()
-        # server peer key: separate pair
-        _sp, server_pub = generate_wg_keypair()
-        record["wg_private"] = priv
-        record["wg_public"] = pub
-        record["wg_peer_public"] = server_pub
-        record["wg_address"] = "10.66.66.2/32"
-        record["wg_dns"] = "1.1.1.1, 1.0.0.1"
-        record["wg_mtu"] = 1280
-        record["wg_port"] = int(port) if int(port) not in (443, 80, 0) else 51820
-        record["wg_allowed"] = "0.0.0.0/0, ::/0"
-        if protocol == "amnezia-wg":
-            record["awg_jc"] = 4
-            record["awg_jmin"] = 40
-            record["awg_jmax"] = 70
-            record["awg_s1"] = 0
-            record["awg_s2"] = 0
-            record["awg_h1"] = 1
-            record["awg_h2"] = 2
-            record["awg_h3"] = 3
-            record["awg_h4"] = 4
+        try:
+            warp = await fetch_warp_amnezia_conf(
+                label=record.get("label") or "WARP",
+                mtu=1280,
+                amnezia=(protocol == "amnezia-wg"),
+            )
+        except Exception as exc:
+            logger.warning("WARP fetch for link failed: %s", exc)
+            warp = {"ok": False}
+        if warp.get("ok"):
+            record["wg_private"] = warp.get("private_key") or ""
+            record["wg_public"] = warp.get("public_key") or ""
+            record["wg_peer_public"] = warp.get("public_key") or ""
+            record["wg_address"] = warp.get("address") or "172.16.0.2/32"
+            record["wg_dns"] = warp.get("dns") or "1.1.1.1"
+            record["wg_mtu"] = int(warp.get("mtu") or 1280)
+            record["wg_allowed"] = warp.get("allowed_ips") or "0.0.0.0/0, ::/0"
+            record["wg_conf"] = warp.get("conf") or ""
+            record["endpoint_host"] = (warp.get("endpoint") or "").rsplit(":", 1)[0]
+            try:
+                record["wg_port"] = int((warp.get("endpoint") or "0:51820").rsplit(":", 1)[-1])
+            except Exception:
+                record["wg_port"] = 51820
+            record["note"] = ((record.get("note") or "") + " | WARP Cloudflare").strip(" |")
+            if protocol == "amnezia-wg":
+                record["awg_jc"] = 4
+                record["awg_jmin"] = 40
+                record["awg_jmax"] = 70
+        else:
+            # fallback random keys (will not connect without a WG server)
+            priv, pub = generate_wg_keypair()
+            _sp, server_pub = generate_wg_keypair()
+            record["wg_private"] = priv
+            record["wg_public"] = pub
+            record["wg_peer_public"] = server_pub
+            record["wg_address"] = "10.66.66.2/32"
+            record["wg_dns"] = "1.1.1.1, 1.0.0.1"
+            record["wg_mtu"] = 1280
+            record["wg_port"] = 51820
+            record["wg_allowed"] = "0.0.0.0/0, ::/0"
 
     async with LINKS_LOCK:
         LINKS[uid] = record
@@ -3772,6 +3943,62 @@ async def create_multi_auto_link(request: Request, _=Depends(require_auth)):
         if eh != default_host or ep != DEFAULT_PORT or pub_sec != "tls":
             endpoints.append(("proxy", eh, ep, pub_sec))
 
+    # AmneziaWG via Cloudflare WARP (optional) — real working conf, not panel UDP
+    amnezia_count = safe_int(body.get("amnezia_count", 0), minimum=0, maximum=5)
+    amnezia_list = []
+    if amnezia_count > 0:
+        for ai in range(amnezia_count):
+            try:
+                res = await fetch_warp_amnezia_conf(
+                    label=f"{sub_name}-AWG-{ai+1}",
+                    mtu=safe_int(body.get("amnezia_mtu", 1280), minimum=576, maximum=1500) or 1280,
+                    jc=safe_int(body.get("amnezia_jc", 4), minimum=1, maximum=128) or 4,
+                    jmin=safe_int(body.get("amnezia_jmin", 40), minimum=1, maximum=1279) or 40,
+                    jmax=safe_int(body.get("amnezia_jmax", 70), minimum=2, maximum=1280) or 70,
+                )
+                if res.get("ok") and res.get("conf"):
+                    amnezia_list.append({
+                        "id": secrets.token_hex(4),
+                        "name": res.get("name") or f"AWG-{ai+1}",
+                        "conf": res["conf"],
+                        "endpoint": res.get("endpoint") or "",
+                        "type": "amnezia",
+                    })
+            except Exception as exc:
+                logger.warning("amnezia generate failed: %s", exc)
+        if amnezia_list:
+            async with SUBS_LOCK:
+                if sub_id in SUBS:
+                    SUBS[sub_id]["amnezia_configs"] = amnezia_list
+                    sub["amnezia_configs"] = amnezia_list
+
+    # WireGuard protocol counts → real WARP WireGuard .conf (Cloudflare)
+    wg_n = int(counts.pop("wireguard", 0) or 0)
+    warp_list = list(sub.get("amnezia_configs") or [])
+    if wg_n > 0:
+        for wi in range(wg_n):
+            try:
+                res = await fetch_warp_amnezia_conf(
+                    label=f"{sub_name}-WG-{wi+1}",
+                    mtu=1280,
+                    amnezia=False,
+                )
+                if res.get("ok") and res.get("conf"):
+                    warp_list.append({
+                        "id": secrets.token_hex(4),
+                        "name": res.get("name") or f"WG-{wi+1}",
+                        "conf": res["conf"],
+                        "endpoint": res.get("endpoint") or "",
+                        "type": "wireguard",
+                    })
+            except Exception as exc:
+                logger.warning("warp wireguard generate failed: %s", exc)
+        if warp_list:
+            async with SUBS_LOCK:
+                if sub_id in SUBS:
+                    SUBS[sub_id]["amnezia_configs"] = warp_list
+                    sub["amnezia_configs"] = warp_list
+
     created = []
     total = 0
     for protocol, n in counts.items():
@@ -3820,6 +4047,7 @@ async def create_multi_auto_link(request: Request, _=Depends(require_auth)):
         "uuid_key": sub["uuid_key"],
         "page": page_url,
         "sub": sub_url,
+        "amnezia_count": len(sub.get("amnezia_configs") or []),
         "count": total,
         "protocols": counts,
         "links": created,
@@ -6280,6 +6508,11 @@ img,canvas,svg{max-width:100%;height:auto}
       <a class="app" href="https://apps.apple.com/app/v2box-v2ray-client/id6446814690" target="_blank" rel="noopener"><div><div class="name">V2Box</div><div class="desc">آیفون · رایگان</div></div><span class="go">دانلود</span></a>
       <a class="app" href="https://apps.apple.com/app/shadowrocket/id932747118" target="_blank" rel="noopener"><div><div class="name">Shadowrocket</div><div class="desc">آیفون · پولی</div></div><span class="go">دانلود</span></a>
     </div>
+    <div id="awgBox" style="display:none;margin-top:18px">
+      <div class="sec-title">AmneziaWG</div>
+      <p style="font-size:12px;color:var(--t3);line-height:1.7;margin-bottom:10px">کانفیگ‌های AmneziaWG (WARP) — در اپ AmneziaVPN یا کلاینت AWG وارد کنید.</p>
+      <div id="awgList" style="display:flex;flex-direction:column;gap:8px"></div>
+    </div>
     <div id="tgProxyBox" style="display:none;margin-top:18px">
       <div class="sec-title">پروکسی تلگرام</div>
       <p style="font-size:12px;color:var(--t3);line-height:1.7;margin-bottom:10px">یکی از پروکسی‌ها را باز کنید تا در تلگرام اضافه شود.</p>
@@ -6377,6 +6610,34 @@ function drawUsageChart(links){
     document.getElementById('barFill').style.width=(lim>0?pct:0)+'%';
     document.getElementById('barPct').textContent=lim>0?(pct.toFixed(1)+'% · '+fmtGB(used)+' / '+fmtGB(lim)):(fmtGB(used)+' / ∞');
     drawUsageChart(d.links||[]);
+    try{
+      const ar=await fetch('/api/public/amnezia/'+key);
+      if(ar.ok){
+        const a=await ar.json();
+        const abox=document.getElementById('awgBox');
+        const alist=document.getElementById('awgList');
+        if(a&&a.ok&&a.configs&&a.configs.length&&abox&&alist){
+          abox.style.display='block';
+          alist.innerHTML=a.configs.map(function(c){
+            const name=c.name||(c.type==='wireguard'?'WireGuard':'AmneziaWG');
+            const conf=c.conf||'';
+            const eid=c.id||'';
+            return '<div class="app" style="flex-direction:column;align-items:stretch;gap:8px">'
+              +'<div style="display:flex;align-items:center;gap:10px"><div style="flex:1"><div class="name">'+name+'</div><div class="desc">AmneziaWG · '+((c.endpoint)||'')+'</div></div></div>'
+              +'<button type="button" class="btn btn-p awg-copy" style="width:100%" data-conf="'+encodeURIComponent(conf)+'">کپی کانفیگ</button>'
+              +'<a class="btn" style="text-align:center;text-decoration:none;background:rgba(255,255,255,.08);color:#e2e8f0;border:1px solid var(--border)" href="/api/public/amnezia/'+key+'/'+eid+'" download>دانلود .conf</a></div>';
+          }).join('');
+          alist.querySelectorAll('.awg-copy').forEach(function(btn){
+            btn.onclick=async function(){
+              try{
+                await navigator.clipboard.writeText(decodeURIComponent(btn.dataset.conf||''));
+                toast('کانفیگ AWG کپی شد');
+              }catch(e){toast('کپی نشد')}
+            };
+          });
+        }
+      }
+    }catch(e){}
     try{
       const mr=await fetch('/api/public/mtproto');
       if(mr.ok){
@@ -7648,6 +7909,78 @@ async def update_apply(_=Depends(require_auth)):
         return {"ok": False, "message": str(exc)}
 
 
+
+@app.post("/api/amnezia/generate")
+async def api_amnezia_generate(request: Request, _=Depends(require_auth)):
+    """Generate AmneziaWG (WARP) conf — works with AmneziaVPN / AWG clients."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    body = body if isinstance(body, dict) else {}
+    count = safe_int(body.get("count", 1), minimum=1, maximum=5) or 1
+    sub_id = body.get("sub_id")
+    results = []
+    for i in range(count):
+        res = await fetch_warp_amnezia_conf(
+            endpoint=str(body.get("endpoint") or "").strip() or None,
+            mtu=safe_int(body.get("mtu", 1280), minimum=576, maximum=1500) or 1280,
+            jc=safe_int(body.get("jc", 4), minimum=1, maximum=128) or 4,
+            jmin=safe_int(body.get("jmin", 40), minimum=1, maximum=1279) or 40,
+            jmax=safe_int(body.get("jmax", 70), minimum=2, maximum=1280) or 70,
+            label=str(body.get("label") or f"AmneziaWG-{i+1}")[:40],
+        )
+        if res.get("ok"):
+            results.append(res)
+    if not results:
+        raise HTTPException(status_code=502, detail="ساخت AmneziaWG ناموفق بود (API WARP)")
+    if sub_id and sub_id in SUBS:
+        async with SUBS_LOCK:
+            existing = list(SUBS[sub_id].get("amnezia_configs") or [])
+            for r in results:
+                existing.append({
+                    "id": secrets.token_hex(4),
+                    "name": r.get("name") or "AWG",
+                    "conf": r["conf"],
+                    "endpoint": r.get("endpoint") or "",
+                })
+            SUBS[sub_id]["amnezia_configs"] = existing[-10:]
+        await save_state()
+    return {"ok": True, "count": len(results), "configs": [{"name": r["name"], "conf": r["conf"], "endpoint": r.get("endpoint")} for r in results]}
+
+
+@app.get("/api/public/amnezia/{uuid_key}")
+async def public_amnezia_list(uuid_key: str):
+    """List AmneziaWG confs attached to a subscription (public)."""
+    async with SUBS_LOCK:
+        sub = next((s for s in SUBS.values() if s.get("uuid_key") == uuid_key), None)
+    if not sub:
+        raise HTTPException(404, detail="not found")
+    items = sub.get("amnezia_configs") or []
+    return {
+        "ok": True,
+        "count": len(items),
+        "configs": [{"id": x.get("id"), "name": x.get("name"), "endpoint": x.get("endpoint"), "conf": x.get("conf")} for x in items],
+    }
+
+
+@app.get("/api/public/amnezia/{uuid_key}/{cfg_id}")
+async def public_amnezia_download(uuid_key: str, cfg_id: str):
+    async with SUBS_LOCK:
+        sub = next((s for s in SUBS.values() if s.get("uuid_key") == uuid_key), None)
+    if not sub:
+        raise HTTPException(404, detail="not found")
+    item = next((x for x in (sub.get("amnezia_configs") or []) if str(x.get("id")) == str(cfg_id)), None)
+    if not item or not item.get("conf"):
+        raise HTTPException(404, detail="config not found")
+    from fastapi.responses import PlainTextResponse
+    return PlainTextResponse(
+        item["conf"],
+        media_type="text/plain; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{item.get("name") or "amnezia"}.conf"'},
+    )
+
+
 @app.get("/api/network")
 async def get_network(request: Request, _=Depends(require_auth)):
     host, port, sec = get_public_endpoint(request)
@@ -8643,7 +8976,12 @@ tr:hover td{background:var(--hover)}
     <div class="card" style="border-color:rgba(139,92,246,.35)">
       <div class="card-title" data-i18n="auto_create">ساخت خودکار چندپروتکلی</div>
       <p style="color:var(--t2);font-size:13px;line-height:1.75;margin-bottom:14px">از هر پروتکل چند کانفیگ بسازید و همه را در یک ساب با نام دلخواه داشته باشید.</p>
-      <div class="field"><label>نام ساب</label><input id="aSubName" placeholder="مثلاً کاربر-۱ یا VIP" maxlength="60"></div>
+      <div class="field"><label>نام ساب</label><input id="aSubName" placeholder="مثلاً کاربر-۱ یا VIP" maxlength="60">
+    <div class="field" style="margin-top:10px">
+      <label>تعداد AmneziaWG (WARP) — جدا از پروتکل‌ها</label>
+      <input id="aAmneziaCnt" type="number" min="0" max="5" value="0" style="direction:ltr;text-align:left">
+      <p style="font-size:11px;color:var(--t3);margin-top:6px;line-height:1.6">اگر بیشتر از ۰ باشد، کانفیگ واقعی AmneziaWG از WARP ساخته و داخل ساب قرار می‌گیرد (اپ AmneziaVPN).</p>
+    </div></div>
       <div class="field"><label>پروتکل‌ها و تعداد</label>
         <div id="aProtoList" style="display:grid;grid-template-columns:1fr 1fr;gap:8px;max-height:220px;overflow:auto;padding:4px 0"></div>
       </div>
@@ -9369,7 +9707,7 @@ function fillMultiProtoList(){
   const labels={
     'vless-ws':'VLESS WebSocket','xhttp-packet-up':'XHTTP Packet Up','xhttp-stream-up':'XHTTP Stream Up','xhttp-stream-one':'XHTTP Stream One',
     'vmess-ws':'VMess WebSocket','trojan-ws':'Trojan WebSocket','shadowsocks':'Shadowsocks','socks5':'SOCKS5','http':'HTTP Proxy',
-    'hysteria2':'Hysteria 2','tuic':'TUIC','wireguard':'WireGuard',
+    'hysteria2':'Hysteria 2','tuic':'TUIC','wireguard':'WireGuard (WARP)',
     'highspeed-demo':'HighSpeed (دمو)','gaming-lite-demo':'Gaming Lite (دمو)'
   };
   // all protocols from API + preferred (no filter out demos)
@@ -9398,6 +9736,7 @@ async function doMultiAutoCreate(){
   if(!Object.keys(protocols).length){toast(lang==='fa'?'حداقل یک پروتکل انتخاب کنید':'Select at least one protocol');return}
   const body={
     sub_name:(document.getElementById('aSubName')?.value||'').trim()||undefined,
+    amnezia_count:Math.max(0,Math.min(5,Number(document.getElementById('aAmneziaCnt')?.value)||0)),
     protocols,
     limit_value:Number(document.getElementById('aLimit')?.value)||0,
     limit_unit:document.getElementById('aUnit')?.value||'GB',
