@@ -7,7 +7,7 @@ import time
 from datetime import datetime
 
 from fastapi import APIRouter, Request, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, Response
 
 import logging
 logger = logging.getLogger("AGN021G.xhttp")
@@ -157,17 +157,27 @@ async def _open_tcp_from_header(first_chunk: bytes):
     return reader, writer, address, port
 
 
+def _resolve_uuid(uuid: str):
+    """Return (canonical_uuid, link) or (uuid, None)."""
+    links = _M().LINKS
+    link = links.get(uuid)
+    if link is not None:
+        return uuid, link
+    compact = (uuid or "").replace("-", "").lower()
+    if not compact:
+        return uuid, None
+    for k, v in links.items():
+        if (k or "").replace("-", "").lower() == compact:
+            return k, v
+    return uuid, None
+
+
 async def _check_link(uuid: str):
     async with _M().LINKS_LOCK:
-        link = _M().LINKS.get(uuid)
-        if link is None:
-            compact = (uuid or "").replace("-", "")
-            for k, v in _M().LINKS.items():
-                if (k or "").replace("-", "") == compact:
-                    link = v
-                    break
+        canon, link = _resolve_uuid(uuid)
     if link is None or not _M().is_link_allowed(link):
         raise HTTPException(status_code=403, detail="not authorized")
+    return canon, link
 
 
 async def _get_or_create_session(uuid: str, mode: str, session_id: str, ip: str = "نامشخص") -> dict:
@@ -178,11 +188,19 @@ async def _get_or_create_session(uuid: str, mode: str, session_id: str, ip: str 
             return sess
 
         async with _M().LINKS_LOCK:
-            link = _M().LINKS.get(uuid)
-        if not _M().is_ip_allowed(link, uuid, ip):
-            logger.warning(f"🚫 XHTTP[{mode}] rejected uuid={uuid[:8]} ip={ip} (ip limit reached)")
-            raise HTTPException(status_code=403, detail="ip limit reached")
+            canon, link = _resolve_uuid(uuid)
+        if link is None or not _M().is_link_allowed(link):
+            raise HTTPException(status_code=403, detail="not authorized")
+        try:
+            if not _M().is_ip_allowed(link, canon, ip):
+                logger.warning(f"🚫 XHTTP[{mode}] rejected uuid={canon[:8]} ip={ip} (ip limit)")
+                raise HTTPException(status_code=403, detail="ip limit reached")
+        except HTTPException:
+            raise
+        except Exception:
+            pass
 
+        uuid = canon
         conn_id = secrets.token_urlsafe(6)
         _M().connections[conn_id] = {
             "uuid": uuid,
@@ -198,8 +216,8 @@ async def _get_or_create_session(uuid: str, mode: str, session_id: str, ip: str 
             "last_seen": time.time(),
             "conn_id": conn_id, "tcp_open": False, "closed": False,
             "seq_buf": {}, "next_seq": 0,
-            "gate": None,  # لازی ساخته می‌شه: _QuotaGate تطبیقی مخصوص stream-up
-            "flow": None,  # لازی ساخته می‌شه: _AdaptiveFlow مخصوص stream-up
+            "gate": None,
+            "flow": None,
         }
         xhttp_sessions[session_id] = sess
         logger.info(f"new XHTTP[{mode}] session [{session_id[:8]}] uuid={uuid[:8]} ip={ip}")
@@ -310,6 +328,19 @@ def _downstream_gen(sess: dict):
     return gen()
 
 
+@router.options("/xhttp-siz10/{rest:path}")
+async def xhttp_options(rest: str):
+    return Response(
+        status_code=204,
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, POST, PUT, OPTIONS",
+            "Access-Control-Allow-Headers": "*",
+            "Access-Control-Max-Age": "86400",
+        },
+    )
+
+
 @router.get("/xhttp-siz10/{mode}/{uuid}/{session_id}")
 async def xhttp_downlink(mode: str, uuid: str, session_id: str, request: Request):
     ensure_reaper()
@@ -317,19 +348,33 @@ async def xhttp_downlink(mode: str, uuid: str, session_id: str, request: Request
         raise HTTPException(status_code=404, detail="unknown mode")
     if mode == "stream-one":
         mode = "stream-up"
-    await _check_link(uuid)
+    try:
+        uuid, _ = await _check_link(uuid)
+    except Exception:
+        # _check_link now returns tuple; if old style fails
+        await _check_link(uuid)
+    # strip possible padding / query junk from session id
+    session_id = (session_id or "").split("?")[0].strip("/") or session_id
     fp = request.query_params.get("fp", DEFAULT_FINGERPRINT)
     sess = await _get_or_create_session(uuid, mode, session_id, _req_client_ip(request))
     if sess.get("closed"):
         raise HTTPException(status_code=404, detail="session closed")
 
     headers = _resp_headers(fp)
-    return StreamingResponse(_downstream_gen(sess), headers=headers, media_type=headers["content-type"])
+    headers["Access-Control-Allow-Origin"] = "*"
+    headers["Cache-Control"] = "no-cache, no-store, no-transform"
+    headers["X-Accel-Buffering"] = "no"
+    return StreamingResponse(_downstream_gen(sess), headers=headers, media_type=headers.get("content-type") or "application/octet-stream")
 
 
 @router.post("/xhttp-siz10/packet-up/{uuid}/{session_id}/{seq}")
 async def packet_up_upload(uuid: str, session_id: str, seq: int, request: Request):
     ensure_reaper()
+    try:
+        uuid, _ = await _check_link(uuid)
+    except TypeError:
+        await _check_link(uuid)
+    session_id = (session_id or "").split("?")[0].strip("/") or session_id
     sess = await _get_or_create_session(uuid, "packet-up", session_id, _req_client_ip(request))
     if sess.get("closed"):
         raise HTTPException(status_code=404, detail="session closed")
@@ -389,6 +434,11 @@ async def packet_up_upload(uuid: str, session_id: str, seq: int, request: Reques
 @router.post("/xhttp-siz10/stream-up/{uuid}/{session_id}")
 async def stream_up_upload(uuid: str, session_id: str, request: Request):
     ensure_reaper()
+    try:
+        uuid, _ = await _check_link(uuid)
+    except TypeError:
+        await _check_link(uuid)
+    session_id = (session_id or "").split("?")[0].strip("/") or session_id
     sess = await _get_or_create_session(uuid, "stream-up", session_id, _req_client_ip(request))
     if sess.get("closed"):
         raise HTTPException(status_code=404, detail="session closed")
@@ -443,5 +493,44 @@ async def stream_up_upload(uuid: str, session_id: str, request: Request):
 
 @router.post("/xhttp-siz10/stream-one/{uuid}/{session_id}")
 async def stream_one_upload(uuid: str, session_id: str, request: Request):
+    return await stream_up_upload(uuid, session_id, request)
+
+
+# ── Flexible routes: Xray may append padding after session id ──────────────
+@router.api_route("/xhttp-siz10/{mode}/{uuid}/{session_id}/{extra:path}", methods=["GET", "POST", "PUT"])
+async def xhttp_flexible(mode: str, uuid: str, session_id: str, extra: str, request: Request):
+    """Accept extra path segments (padding) after session id."""
+    ensure_reaper()
+    if mode not in ("packet-up", "stream-up", "stream-one"):
+        raise HTTPException(status_code=404, detail="unknown mode")
+    try:
+        uuid, _ = await _check_link(uuid)
+    except TypeError:
+        await _check_link(uuid)
+    session_id = (session_id or "").split("?")[0].strip("/") or session_id
+
+    if request.method == "GET":
+        if mode == "stream-one":
+            mode = "stream-up"
+        fp = request.query_params.get("fp", DEFAULT_FINGERPRINT)
+        sess = await _get_or_create_session(uuid, mode, session_id, _req_client_ip(request))
+        if sess.get("closed"):
+            raise HTTPException(status_code=404, detail="session closed")
+        headers = _resp_headers(fp)
+        headers["Access-Control-Allow-Origin"] = "*"
+        headers["X-Accel-Buffering"] = "no"
+        return StreamingResponse(_downstream_gen(sess), headers=headers, media_type=headers.get("content-type") or "application/octet-stream")
+
+    # POST/PUT — if extra looks like seq number → packet-up
+    if mode == "packet-up" or (extra and extra.split("/")[0].isdigit()):
+        seq = 0
+        try:
+            seq = int(extra.split("/")[0])
+        except Exception:
+            seq = 0
+        return await packet_up_upload(uuid, session_id, seq, request)
+
+    if mode == "stream-one":
+        return await stream_up_upload(uuid, session_id, request)
     return await stream_up_upload(uuid, session_id, request)
 

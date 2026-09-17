@@ -399,9 +399,9 @@ DEFAULT_FINGERPRINT = "chrome"
 
 DEFAULT_ALPN_BY_PROTOCOL = {
     "vless-ws": "http/1.1",
-    "xhttp-packet-up": "h2,http/1.1",
-    "xhttp-stream-up": "h2,http/1.1",
-    "xhttp-stream-one": "h2,http/1.1",
+    "xhttp-packet-up": "http/1.1",
+    "xhttp-stream-up": "http/1.1",
+    "xhttp-stream-one": "http/1.1",
 }
 
 DEFAULT_PORT = 443
@@ -625,18 +625,100 @@ AWG_PROFILES = (
 )
 
 
+
+def _build_awg_conf_text(
+    *,
+    priv: str,
+    pub: str,
+    psk: str = "",
+    addr: str = "172.16.0.2/32",
+    dns: str = "1.1.1.1",
+    allowed: str = "0.0.0.0/0, ::/0",
+    endpoint: str = "",
+    mtu: int = 1280,
+    jc: int = 4,
+    jmin: int = 40,
+    jmax: int = 70,
+    label: str = "AmneziaWG",
+    amnezia: bool = True,
+) -> str:
+    """Build WireGuard / AmneziaWG conf text from known keys (no network)."""
+    if jmax <= jmin:
+        jmax = jmin + 1
+    mtu = max(576, min(1500, int(mtu or 1280)))
+    kind = "AmneziaWG" if amnezia else "WireGuard"
+    lines = [
+        f"# {label} · {kind} (WARP/Cloudflare)",
+        "[Interface]",
+        f"PrivateKey = {priv}",
+        f"Address = {addr}",
+        f"DNS = {dns}",
+        f"MTU = {mtu}",
+    ]
+    if amnezia:
+        lines += [
+            f"Jc = {int(jc)}",
+            f"Jmin = {int(jmin)}",
+            f"Jmax = {int(jmax)}",
+            "S1 = 0",
+            "S2 = 0",
+            "H1 = 1",
+            "H2 = 2",
+            "H3 = 3",
+            "H4 = 4",
+        ]
+    lines += ["", "[Peer]", f"PublicKey = {pub}"]
+    if psk:
+        lines.append(f"PresharedKey = {psk}")
+    lines += [
+        f"AllowedIPs = {allowed}",
+        f"Endpoint = {endpoint}",
+        "PersistentKeepalive = 25",
+    ]
+    return "\n".join(lines) + "\n"
+
+
 async def generate_amnezia_profile_batch(count: int = 6, sub_name: str = "AWG") -> list:
-    """Build up to `count` AmneziaWG WARP confs covering all profiles (no exception)."""
-    import random as _rnd
+    """One WARP account → N Amnezia confs with different junk profiles (like the HTML tool).
+
+    Previously each profile re-fetched WARP and rate-limits left only 1 success.
+    """
     count = max(0, min(int(count or 0), len(AWG_PROFILES)))
     if count <= 0:
         return []
-    profiles = list(AWG_PROFILES[:count])
-    # if user wants fewer than all, still cycle unique profiles
-    out = []
-    for i, prof in enumerate(profiles):
+
+    base = None
+    last_err = None
+    for attempt in range(4):
         try:
-            res = await fetch_warp_amnezia_conf(
+            base = await fetch_warp_amnezia_conf(
+                label=f"{sub_name}-base",
+                mtu=1280,
+                amnezia=True,
+            )
+            if base and base.get("ok") and base.get("private_key") and base.get("public_key") and base.get("endpoint"):
+                break
+            last_err = (base or {}).get("error") or "empty"
+        except Exception as exc:
+            last_err = str(exc)
+            base = None
+        await asyncio.sleep(0.6 * (attempt + 1))
+
+    if not base or not base.get("ok"):
+        logger.warning("AWG batch: WARP fetch failed after retries: %s", last_err)
+        return []
+
+    out = []
+    for prof in AWG_PROFILES[:count]:
+        try:
+            conf = _build_awg_conf_text(
+                priv=base["private_key"],
+                pub=base["public_key"],
+                psk=base.get("preshared_key") or "",
+                addr=base.get("address") or "172.16.0.2/32",
+                dns=base.get("dns") or "1.1.1.1",
+                allowed=base.get("allowed_ips") or "0.0.0.0/0, ::/0",
+                endpoint=base.get("endpoint") or "",
                 mtu=int(prof["mtu"]),
                 jc=int(prof["jc"]),
                 jmin=int(prof["jmin"]),
@@ -644,35 +726,24 @@ async def generate_amnezia_profile_batch(count: int = 6, sub_name: str = "AWG") 
                 label=f"{sub_name}-{prof['name']}",
                 amnezia=True,
             )
-            if not res.get("ok"):
-                # one retry with different shuffle inside fetch
-                res = await fetch_warp_amnezia_conf(
-                    mtu=int(prof["mtu"]),
-                    jc=int(prof["jc"]),
-                    jmin=int(prof["jmin"]),
-                    jmax=int(prof["jmax"]),
-                    label=f"{sub_name}-{prof['name']}",
-                    amnezia=True,
-                )
-            if res.get("ok") and res.get("conf"):
-                out.append({
-                    "id": secrets.token_hex(4),
-                    "name": f"{prof['name']} · {prof['label_fa']}",
-                    "conf": res["conf"],
-                    "endpoint": res.get("endpoint") or "",
-                    "type": "amnezia",
-                    "profile": prof["id"],
-                    "suitable": prof["suitable"],
-                    "label_fa": prof["label_fa"],
-                    "jc": prof["jc"],
-                    "jmin": prof["jmin"],
-                    "jmax": prof["jmax"],
-                    "mtu": prof["mtu"],
-                })
-            else:
-                logger.warning("AWG profile %s failed: %s", prof["id"], res.get("error"))
+            out.append({
+                "id": secrets.token_hex(4),
+                "name": f"{prof['name']} · {prof['label_fa']}",
+                "conf": conf,
+                "endpoint": base.get("endpoint") or "",
+                "type": "amnezia",
+                "profile": prof["id"],
+                "suitable": prof["suitable"],
+                "label_fa": prof["label_fa"],
+                "jc": prof["jc"],
+                "jmin": prof["jmin"],
+                "jmax": prof["jmax"],
+                "mtu": prof["mtu"],
+            })
         except Exception as exc:
-            logger.warning("AWG profile %s error: %s", prof["id"], exc)
+            logger.warning("AWG profile build %s error: %s", prof.get("id"), exc)
+
+    logger.info("AWG batch built %s/%s profiles for %s", len(out), count, sub_name)
     return out
 
 
@@ -1638,18 +1709,21 @@ def generate_vless_link(
         return "vless://" + uuid + "@" + host_url + ":" + str(port_value) + "?" + "&".join(f"{k}={quote(str(v), safe=',/')}" for k,v in q.items()) + "#" + label
     if protocol.startswith("xhttp-"):
         mode = protocol.replace("xhttp-", "")
+        # Path MUST end with / so Xray appends sessionId as /path/session[/seq]
+        # ALPN prefer http/1.1 on Railway (edge→origin often H1; H2-only clients fail)
+        path = f"/xhttp-siz10/{mode}/{uuid}/"
         q = {
             "encryption": "none",
             "security": sec,
             "type": "xhttp",
             "mode": mode,
             "host": host,
-            "path": f"/xhttp-siz10/{mode}/{uuid}",
+            "path": path,
             "fp": fp,
         }
         if sec == "tls":
             q["sni"] = host
-            q["alpn"] = alpn_value or "h2,http/1.1"
+            q["alpn"] = alpn_value or "http/1.1"
         return "vless://" + uuid + "@" + host_url + ":" + str(port_value) + "?" + "&".join(f"{k}={quote(str(v), safe=',/')}" for k,v in q.items()) + "#" + label
     if protocol == "vmess-ws":
         raw = {"v":"2","ps":remark,"add":host,"port":port_value,"id":uuid,"aid":0,"scy":"auto","net":"ws","type":"none","host":host,"path":f"/ws/{uuid}","tls":"tls","sni":host,"fp":fp}
@@ -4068,24 +4142,39 @@ async def create_multi_auto_link(request: Request, _=Depends(require_auth)):
         else:
             logger.warning("AWG batch empty for sub %s (WARP API failed?)", sub_name)
 
-    # WireGuard protocol counts → real WARP WireGuard .conf (Cloudflare)
+    # WireGuard protocol counts → WARP WireGuard .conf (reuse last WARP keys if possible)
     wg_n = int(counts.pop("wireguard", 0) or 0)
     warp_list = list(sub.get("amnezia_configs") or [])
     if wg_n > 0:
+        wg_base = None
         for wi in range(wg_n):
             try:
-                res = await fetch_warp_amnezia_conf(
-                    label=f"{sub_name}-WG-{wi+1}",
-                    mtu=1280,
-                    amnezia=False,
-                )
-                if res.get("ok") and res.get("conf"):
+                if wg_base is None:
+                    wg_base = await fetch_warp_amnezia_conf(
+                        label=f"{sub_name}-WG",
+                        mtu=1280,
+                        amnezia=False,
+                    )
+                if wg_base and wg_base.get("ok"):
+                    conf = _build_awg_conf_text(
+                        priv=wg_base["private_key"],
+                        pub=wg_base["public_key"],
+                        psk=wg_base.get("preshared_key") or "",
+                        addr=wg_base.get("address") or "172.16.0.2/32",
+                        dns=wg_base.get("dns") or "1.1.1.1",
+                        allowed=wg_base.get("allowed_ips") or "0.0.0.0/0, ::/0",
+                        endpoint=wg_base.get("endpoint") or "",
+                        mtu=1280,
+                        label=f"{sub_name}-WG-{wi+1}",
+                        amnezia=False,
+                    )
                     warp_list.append({
                         "id": secrets.token_hex(4),
-                        "name": res.get("name") or f"WG-{wi+1}",
-                        "conf": res["conf"],
-                        "endpoint": res.get("endpoint") or "",
+                        "name": f"WG-{wi+1} · WireGuard WARP",
+                        "conf": conf,
+                        "endpoint": wg_base.get("endpoint") or "",
                         "type": "wireguard",
+                        "suitable": "WireGuard استاندارد · کلاینت WG / AWG",
                     })
             except Exception as exc:
                 logger.warning("warp wireguard generate failed: %s", exc)
