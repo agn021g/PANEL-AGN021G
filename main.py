@@ -4016,10 +4016,10 @@ async def create_auto_link(
     profile = str(body.get("profile", "balanced")).strip().lower()
     profiles = {
         "normal": {"ip": 0, "conn": 0, "speed": 0, "fp": "chrome", "fragment": "off"},
-        "balanced": {"ip": 2, "conn": 6, "speed": 0, "fp": "chrome", "fragment": "safe"},
-        "gaming": {"ip": 1, "conn": 3, "speed": 0, "fp": "chrome", "fragment": "safe"},
+        "balanced": {"ip": 0, "conn": 0, "speed": 0, "fp": "chrome", "fragment": "off"},
+        "gaming": {"ip": 0, "conn": 0, "speed": 0, "fp": "chrome", "fragment": "off"},
         "speed": {"ip": 0, "conn": 0, "speed": 0, "fp": "chrome", "fragment": "off"},
-        "stable": {"ip": 2, "conn": 4, "speed": 0, "fp": "firefox", "fragment": "tlshello"},
+        "stable": {"ip": 0, "conn": 0, "speed": 0, "fp": "firefox", "fragment": "off"},
         "maximum": {"ip": 0, "conn": 0, "speed": 0, "fp": "randomized", "fragment": "safe"},
     }
     cfg = profiles.get(profile, profiles["balanced"])

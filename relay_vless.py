@@ -183,7 +183,7 @@ async def relay_ws_to_tcp(ws: WebSocket, writer: asyncio.StreamWriter, conn_id: 
 
 
 async def relay_tcp_to_ws(ws: WebSocket, reader: asyncio.StreamReader, conn_id: str, uid: str):
-    first = True
+    """Forward remote TCP bytes to client. VLESS header must already have been sent once."""
     gate = _QuotaBatch(uid)
     try:
         while True:
@@ -194,14 +194,16 @@ async def relay_tcp_to_ws(ws: WebSocket, reader: asyncio.StreamReader, conn_id: 
                 await ws.close(code=1008, reason="quota/disabled/unknown")
                 break
             await throttle(uid, len(data))
-            _M().connections[conn_id]["bytes"] += len(data)
-            payload = (b"\x00\x00" + data) if first else data
-            first = False
-            await ws.send_bytes(payload)
+            try:
+                _M().connections[conn_id]["bytes"] += len(data)
+            except Exception:
+                pass
+            await ws.send_bytes(data)
     except Exception:
         pass
     finally:
         await gate.flush()
+
 
 
 async def open_dual_stack(address: str, port: int, timeout: float = 10.0):
@@ -309,6 +311,116 @@ def _resolve_link(uuid: str):
             if (k or "").replace("-", "") == compact:
                 return k, v
     return uuid, None
+
+
+
+async def _udp_tunnel(ws: WebSocket, address: str, port: int, initial: bytes, conn_id: str, uid: str, ver: bytes):
+    """Basic VLESS UDP (DNS etc.). Always reply VLESS OK first."""
+    import socket
+    try:
+        await ws.send_bytes((ver if ver else bytes([0])) + bytes([0]))
+    except Exception:
+        try:
+            await ws.send_bytes(bytes([0, 0]))
+        except Exception:
+            return
+
+    loop = asyncio.get_running_loop()
+    try:
+        infos = await loop.getaddrinfo(address, port, type=socket.SOCK_DGRAM, family=socket.AF_INET)
+    except Exception:
+        try:
+            infos = await loop.getaddrinfo(address, port, type=socket.SOCK_DGRAM)
+        except Exception as exc:
+            logger.warning("UDP resolve failed %s:%s %s", address, port, exc)
+            return
+    if not infos:
+        return
+    dest = infos[0][4]
+    sock = socket.socket(infos[0][0], socket.SOCK_DGRAM)
+    sock.setblocking(False)
+
+    def strip_len_prefix(data: bytes) -> bytes:
+        if len(data) >= 2:
+            ln = int.from_bytes(data[:2], "big")
+            if ln == len(data) - 2 and 0 < ln <= 65535:
+                return data[2:]
+        return data
+
+    async def send_udp(data: bytes):
+        data = strip_len_prefix(data)
+        if not data:
+            return
+        await loop.sock_sendto(sock, data, dest)
+        try:
+            _M().connections[conn_id]["bytes"] += len(data)
+        except Exception:
+            pass
+
+    if initial:
+        try:
+            await send_udp(initial)
+        except Exception as exc:
+            logger.warning("UDP send failed: %s", exc)
+
+    async def ws_to_udp():
+        gate = _QuotaBatch(uid)
+        try:
+            while True:
+                msg = await ws.receive()
+                if msg["type"] == "websocket.disconnect":
+                    break
+                data = msg.get("bytes") or b""
+                if not data:
+                    continue
+                if not await gate.add(len(data)):
+                    break
+                await throttle(uid, len(data))
+                await send_udp(data)
+        except Exception:
+            pass
+        finally:
+            await gate.flush()
+
+    async def udp_to_ws():
+        gate = _QuotaBatch(uid)
+        try:
+            while True:
+                try:
+                    data, _ = await asyncio.wait_for(loop.sock_recvfrom(sock, 65535), timeout=45.0)
+                except asyncio.TimeoutError:
+                    continue
+                if not data:
+                    break
+                if not await gate.add(len(data)):
+                    break
+                await throttle(uid, len(data))
+                try:
+                    _M().connections[conn_id]["bytes"] += len(data)
+                except Exception:
+                    pass
+                await ws.send_bytes(len(data).to_bytes(2, "big") + data)
+        except Exception:
+            pass
+        finally:
+            await gate.flush()
+
+    try:
+        done, pending = await asyncio.wait(
+            {asyncio.create_task(ws_to_udp()), asyncio.create_task(udp_to_ws())},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for t in pending:
+            t.cancel()
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
 
 
 async def websocket_tunnel(ws: WebSocket, uuid: str):
