@@ -7,7 +7,7 @@ import time
 from datetime import datetime
 
 from fastapi import APIRouter, Request, HTTPException
-from fastapi.responses import StreamingResponse, Response
+from fastapi.responses import StreamingResponse
 
 import logging
 logger = logging.getLogger("AGN021G.xhttp")
@@ -25,23 +25,23 @@ except Exception:
 
 router = APIRouter()
 
-XHTTP_BUF = 2 * 1024 * 1024  # 2MB read chunks
-DOWNLINK_QUEUE_MAX = 1024
-SESSION_IDLE_TIMEOUT = 45
-REAPER_INTERVAL = 15
+XHTTP_BUF = 512 * 1024
+DOWNLINK_QUEUE_MAX = 512
+SESSION_IDLE_TIMEOUT = 30
+REAPER_INTERVAL = 10
 TCP_CONNECT_TIMEOUT = 10.0
-SOCK_BUF_SIZE = 4 * 1024 * 1024  # 4MB kernel buffers
-FLOW_MIN_HW = 512 * 1024
-FLOW_MAX_HW = 32 * 1024 * 1024
-FLOW_START_HW = 4 * 1024 * 1024
-FLOW_FAST_DRAIN_MS = 1.5
-FLOW_SLOW_DRAIN_MS = 20.0
-QUOTA_MIN_BATCH = 64 * 1024
-QUOTA_MAX_BATCH = 2 * 1024 * 1024
-QUOTA_START_BATCH = 128 * 1024
-QUOTA_CHECK_INTERVAL = 0.35
+SOCK_BUF_SIZE = 2 * 1024 * 1024
+FLOW_MIN_HW = 256 * 1024
+FLOW_MAX_HW = 16 * 1024 * 1024
+FLOW_START_HW = 2 * 1024 * 1024
+FLOW_FAST_DRAIN_MS = 2.0  
+FLOW_SLOW_DRAIN_MS = 25.0  
+QUOTA_MIN_BATCH = 32 * 1024
+QUOTA_MAX_BATCH = 1 * 1024 * 1024
+QUOTA_START_BATCH = 64 * 1024
+QUOTA_CHECK_INTERVAL = 0.2 
 
-PACKET_UP_HIGH_WATER = 4 * 1024 * 1024  
+PACKET_UP_HIGH_WATER = 2 * 1024 * 1024  
 
 xhttp_sessions: dict = {}
 XHTTP_LOCK = asyncio.Lock()
@@ -148,7 +148,7 @@ def _req_client_ip(request: Request) -> str:
 async def _open_tcp_from_header(first_chunk: bytes):
     command, address, port, payload = await parse_vless_header(first_chunk)
     reader, writer = await asyncio.wait_for(
-        open_dual_stack(address, port, timeout=TCP_CONNECT_TIMEOUT), timeout=TCP_CONNECT_TIMEOUT + 2
+        asyncio.open_connection(address, port), timeout=TCP_CONNECT_TIMEOUT
     )
     _tune_socket(writer)
     if payload:
@@ -157,27 +157,11 @@ async def _open_tcp_from_header(first_chunk: bytes):
     return reader, writer, address, port
 
 
-def _resolve_uuid(uuid: str):
-    """Return (canonical_uuid, link) or (uuid, None)."""
-    links = _M().LINKS
-    link = links.get(uuid)
-    if link is not None:
-        return uuid, link
-    compact = (uuid or "").replace("-", "").lower()
-    if not compact:
-        return uuid, None
-    for k, v in links.items():
-        if (k or "").replace("-", "").lower() == compact:
-            return k, v
-    return uuid, None
-
-
 async def _check_link(uuid: str):
     async with _M().LINKS_LOCK:
-        canon, link = _resolve_uuid(uuid)
-    if link is None or not _M().is_link_allowed(link):
+        link = _M().LINKS.get(uuid)
+    if not _M().is_link_allowed(link):
         raise HTTPException(status_code=403, detail="not authorized")
-    return canon, link
 
 
 async def _get_or_create_session(uuid: str, mode: str, session_id: str, ip: str = "نامشخص") -> dict:
@@ -188,19 +172,11 @@ async def _get_or_create_session(uuid: str, mode: str, session_id: str, ip: str 
             return sess
 
         async with _M().LINKS_LOCK:
-            canon, link = _resolve_uuid(uuid)
-        if link is None or not _M().is_link_allowed(link):
-            raise HTTPException(status_code=403, detail="not authorized")
-        try:
-            if not _M().is_ip_allowed(link, canon, ip):
-                logger.warning(f"🚫 XHTTP[{mode}] rejected uuid={canon[:8]} ip={ip} (ip limit)")
-                raise HTTPException(status_code=403, detail="ip limit reached")
-        except HTTPException:
-            raise
-        except Exception:
-            pass
+            link = _M().LINKS.get(uuid)
+        if not _M().is_ip_allowed(link, uuid, ip):
+            logger.warning(f"🚫 XHTTP[{mode}] rejected uuid={uuid[:8]} ip={ip} (ip limit reached)")
+            raise HTTPException(status_code=403, detail="ip limit reached")
 
-        uuid = canon
         conn_id = secrets.token_urlsafe(6)
         _M().connections[conn_id] = {
             "uuid": uuid,
@@ -216,8 +192,8 @@ async def _get_or_create_session(uuid: str, mode: str, session_id: str, ip: str 
             "last_seen": time.time(),
             "conn_id": conn_id, "tcp_open": False, "closed": False,
             "seq_buf": {}, "next_seq": 0,
-            "gate": None,
-            "flow": None,
+            "gate": None,  # لازی ساخته می‌شه: _QuotaGate تطبیقی مخصوص stream-up
+            "flow": None,  # لازی ساخته می‌شه: _AdaptiveFlow مخصوص stream-up
         }
         xhttp_sessions[session_id] = sess
         logger.info(f"new XHTTP[{mode}] session [{session_id[:8]}] uuid={uuid[:8]} ip={ip}")
@@ -277,8 +253,8 @@ def ensure_reaper():
 
 
 async def _pump_tcp_to_queue(session_id: str, uuid: str, reader: asyncio.StreamReader, down_q: asyncio.Queue):
-    """TCP→queue. VLESS response already queued when session opens TCP."""
-    gate = _QuotaGate(uuid)
+    first = True
+    gate = _QuotaGate(uuid) 
     try:
         while True:
             data = await reader.read(XHTTP_BUF)
@@ -290,21 +266,16 @@ async def _pump_tcp_to_queue(session_id: str, uuid: str, reader: asyncio.StreamR
             async with XHTTP_LOCK:
                 sess = xhttp_sessions.get(session_id)
             if sess:
-                try:
-                    c = _M().connections.get(sess["conn_id"])
-                    if c:
-                        c["bytes"] += len(data)
-                except Exception:
-                    pass
-            await down_q.put(data)
+                c = _M().connections.get(sess["conn_id"])
+                if c:
+                    c["bytes"] += len(data)
+            payload = (b"\x00\x00" + data) if first else data
+            first = False
+            await down_q.put(payload)
     except (asyncio.CancelledError, Exception):
         pass
     finally:
         await gate.flush()
-        try:
-            await down_q.put(None)
-        except Exception:
-            pass
         await _teardown(session_id)
 
 
@@ -313,15 +284,6 @@ async def _open_tcp_for_session(session_id: str, uuid: str, sess: dict, first_ch
     logger.info(f"connect XHTTP[{sess['mode']}] [{session_id[:8]}] -> {address}:{port}")
     sess["writer"] = writer
     sess["tcp_open"] = True
-    # VLESS success on downlink immediately
-    try:
-        ver = first_chunk[0:1] if first_chunk else bytes([0])
-        await sess["down_q"].put(ver + bytes([0]))
-    except Exception:
-        try:
-            await sess["down_q"].put(bytes([0, 0]))
-        except Exception:
-            pass
     sess["downlink_task"] = asyncio.create_task(
         _pump_tcp_to_queue(session_id, uuid, reader, sess["down_q"])
     )
@@ -342,53 +304,24 @@ def _downstream_gen(sess: dict):
     return gen()
 
 
-@router.options("/xhttp-siz10/{rest:path}")
-async def xhttp_options(rest: str):
-    return Response(
-        status_code=204,
-        headers={
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "GET, POST, PUT, OPTIONS",
-            "Access-Control-Allow-Headers": "*",
-            "Access-Control-Max-Age": "86400",
-        },
-    )
-
-
 @router.get("/xhttp-siz10/{mode}/{uuid}/{session_id}")
 async def xhttp_downlink(mode: str, uuid: str, session_id: str, request: Request):
     ensure_reaper()
-    if mode not in ("packet-up", "stream-up", "stream-one"):
+    if mode not in ("packet-up", "stream-up"):
         raise HTTPException(status_code=404, detail="unknown mode")
-    if mode == "stream-one":
-        mode = "stream-up"
-    try:
-        uuid, _ = await _check_link(uuid)
-    except Exception:
-        # _check_link now returns tuple; if old style fails
-        await _check_link(uuid)
-    # strip possible padding / query junk from session id
-    session_id = (session_id or "").split("?")[0].strip("/") or session_id
+    await _check_link(uuid)
     fp = request.query_params.get("fp", DEFAULT_FINGERPRINT)
     sess = await _get_or_create_session(uuid, mode, session_id, _req_client_ip(request))
     if sess.get("closed"):
         raise HTTPException(status_code=404, detail="session closed")
 
     headers = _resp_headers(fp)
-    headers["Access-Control-Allow-Origin"] = "*"
-    headers["Cache-Control"] = "no-cache, no-store, no-transform"
-    headers["X-Accel-Buffering"] = "no"
-    return StreamingResponse(_downstream_gen(sess), headers=headers, media_type=headers.get("content-type") or "application/octet-stream")
+    return StreamingResponse(_downstream_gen(sess), headers=headers, media_type=headers["content-type"])
 
 
 @router.post("/xhttp-siz10/packet-up/{uuid}/{session_id}/{seq}")
 async def packet_up_upload(uuid: str, session_id: str, seq: int, request: Request):
     ensure_reaper()
-    try:
-        uuid, _ = await _check_link(uuid)
-    except TypeError:
-        await _check_link(uuid)
-    session_id = (session_id or "").split("?")[0].strip("/") or session_id
     sess = await _get_or_create_session(uuid, "packet-up", session_id, _req_client_ip(request))
     if sess.get("closed"):
         raise HTTPException(status_code=404, detail="session closed")
@@ -404,7 +337,7 @@ async def packet_up_upload(uuid: str, session_id: str, seq: int, request: Reques
     await throttle(uuid, len(body))
 
     _M().stats["total_requests"] += 1
-    _M().connections[sess["conn_id"]]["bytes"] += len(body)
+    connections[sess["conn_id"]]["bytes"] += len(body)
 
     try:
         if sess["writer"] is None:
@@ -448,11 +381,6 @@ async def packet_up_upload(uuid: str, session_id: str, seq: int, request: Reques
 @router.post("/xhttp-siz10/stream-up/{uuid}/{session_id}")
 async def stream_up_upload(uuid: str, session_id: str, request: Request):
     ensure_reaper()
-    try:
-        uuid, _ = await _check_link(uuid)
-    except TypeError:
-        await _check_link(uuid)
-    session_id = (session_id or "").split("?")[0].strip("/") or session_id
     sess = await _get_or_create_session(uuid, "stream-up", session_id, _req_client_ip(request))
     if sess.get("closed"):
         raise HTTPException(status_code=404, detail="session closed")
@@ -467,7 +395,7 @@ async def stream_up_upload(uuid: str, session_id: str, request: Request):
         flow = _AdaptiveFlow()
         sess["flow"] = flow
 
-    conn = _M().connections[sess["conn_id"]]   # یک بار لوک‌آپ، نه هر چانک
+    conn = connections[sess["conn_id"]]   # یک بار لوک‌آپ، نه هر چانک
     writer = sess["writer"]               # ممکنه هنوز None باشه
 
     try:
@@ -503,48 +431,3 @@ async def stream_up_upload(uuid: str, session_id: str, request: Request):
 
     await gate.flush()
     return {"ok": True}
-
-
-@router.post("/xhttp-siz10/stream-one/{uuid}/{session_id}")
-async def stream_one_upload(uuid: str, session_id: str, request: Request):
-    return await stream_up_upload(uuid, session_id, request)
-
-
-# ── Flexible routes: Xray may append padding after session id ──────────────
-@router.api_route("/xhttp-siz10/{mode}/{uuid}/{session_id}/{extra:path}", methods=["GET", "POST", "PUT"])
-async def xhttp_flexible(mode: str, uuid: str, session_id: str, extra: str, request: Request):
-    """Accept extra path segments (padding) after session id."""
-    ensure_reaper()
-    if mode not in ("packet-up", "stream-up", "stream-one"):
-        raise HTTPException(status_code=404, detail="unknown mode")
-    try:
-        uuid, _ = await _check_link(uuid)
-    except TypeError:
-        await _check_link(uuid)
-    session_id = (session_id or "").split("?")[0].strip("/") or session_id
-
-    if request.method == "GET":
-        if mode == "stream-one":
-            mode = "stream-up"
-        fp = request.query_params.get("fp", DEFAULT_FINGERPRINT)
-        sess = await _get_or_create_session(uuid, mode, session_id, _req_client_ip(request))
-        if sess.get("closed"):
-            raise HTTPException(status_code=404, detail="session closed")
-        headers = _resp_headers(fp)
-        headers["Access-Control-Allow-Origin"] = "*"
-        headers["X-Accel-Buffering"] = "no"
-        return StreamingResponse(_downstream_gen(sess), headers=headers, media_type=headers.get("content-type") or "application/octet-stream")
-
-    # POST/PUT — if extra looks like seq number → packet-up
-    if mode == "packet-up" or (extra and extra.split("/")[0].isdigit()):
-        seq = 0
-        try:
-            seq = int(extra.split("/")[0])
-        except Exception:
-            seq = 0
-        return await packet_up_upload(uuid, session_id, seq, request)
-
-    if mode == "stream-one":
-        return await stream_up_upload(uuid, session_id, request)
-    return await stream_up_upload(uuid, session_id, request)
-
