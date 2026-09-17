@@ -216,6 +216,29 @@ async def open_dual_stack(address: str, port: int, timeout: float = 10.0):
         prefer_v6 = False
 
     loop = asyncio.get_running_loop()
+    # Fast path: literal IP — skip DNS
+    try:
+        import ipaddress as _ip
+        _ip.ip_address(address.strip("[]"))
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(address.strip("[]"), port),
+            timeout=min(4.0, float(timeout)),
+        )
+        sock = writer.get_extra_info("socket")
+        if sock is not None:
+            try:
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, SOCK_BUF)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, SOCK_BUF)
+            except Exception:
+                pass
+        return reader, writer
+    except ValueError:
+        pass  # not an IP literal
+    except Exception as e:
+        raise e
+
     infos4, infos6 = [], []
     try:
         infos4 = await loop.getaddrinfo(address, port, type=socket.SOCK_STREAM, family=socket.AF_INET)

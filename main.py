@@ -4131,15 +4131,39 @@ async def create_multi_auto_link(request: Request, _=Depends(require_auth)):
                     sub_id=sub_id,
                     config_count=1,
                 )
-                link["security_profile"] = profile
-                link["endpoint_host"] = ep_host
-                link["security"] = ep_sec
-                link["port"] = int(ep_port)
+                async with LINKS_LOCK:
+                    if uid in LINKS:
+                        LINKS[uid]["security_profile"] = profile
+                        LINKS[uid]["endpoint_host"] = ep_host
+                        LINKS[uid]["security"] = ep_sec
+                        LINKS[uid]["port"] = int(ep_port)
+                        link = LINKS[uid]
                 created.append(get_link_info(link, uid, ep_host))
                 total += 1
 
+    # if user only selected non-working protocols, still give one working VLESS
+    if total == 0 and not (sub.get("amnezia_configs") or []):
+        uid, link = await make_link(
+            label=sanitize_config_name(f"{sub_name}-VLESS")[:40],
+            limit_bytes=0,
+            expires_at=expires_at,
+            ip_limit=ip_limit,
+            speed_limit_bytes=speed_bytes,
+            connection_limit=cfg["conn"],
+            note=f"Multi-auto fallback | {sub_name}",
+            protocol=DEFAULT_PROTOCOL,
+            fingerprint=cfg["fp"],
+            alpn=DEFAULT_ALPN_BY_PROTOCOL.get(DEFAULT_PROTOCOL, ""),
+            port=DEFAULT_PORT,
+            fragment=cfg["fragment"],
+            sub_id=sub_id,
+            config_count=1,
+        )
+        created.append(get_link_info(link, uid, host))
+        total = 1
+
     await save_state()
-    log_activity("sub", f"ساب «{sub_name}» با {total} کانفیگ چندپروتکلی ساخته شد", "ok")
+    log_activity("sub", f"ساب «{sub_name}» با {total} کانفیگ + {len(sub.get('amnezia_configs') or [])} WARP", "ok")
 
     sub_url = f"https://{host}/sub-group/{sub['uuid_key']}"
     page_url = sub_url
@@ -4160,9 +4184,20 @@ async def create_multi_auto_link(request: Request, _=Depends(require_auth)):
 
 
 @app.get("/api/protocols")
-async def api_protocols(request: Request):
-    require_auth(request)
-    return {"protocols": [{"id": p, "label": PROTOCOL_LABELS.get(p, p)} for p in PROTOCOLS], "default": DEFAULT_PROTOCOL}
+async def api_protocols(_=Depends(require_auth)):
+    return {
+        "protocols": [
+            {
+                "id": p,
+                "label": PROTOCOL_LABELS.get(p, p),
+                "working": p in WORKING_RELAY_PROTOCOLS or p in WARP_CONF_PROTOCOLS,
+            }
+            for p in PROTOCOLS
+        ],
+        "default": DEFAULT_PROTOCOL,
+        "working_relay": list(WORKING_RELAY_PROTOCOLS),
+        "warp_conf": list(WARP_CONF_PROTOCOLS),
+    }
 
 
 @app.get("/api/links")
