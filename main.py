@@ -563,6 +563,106 @@ WARP_AWG_ENDPOINTS = (
 )
 
 
+
+# AmneziaWG junk profiles (aligned with common generators: light / medium / heavy)
+AWG_PROFILES = (
+    {
+        "id": "light",
+        "name": "AWG-Light",
+        "label_fa": "سبک · سرعت بیشتر",
+        "suitable": "شبکه معمولی / وای‌فای خانگی · کمترین سربار",
+        "jc": 3, "jmin": 1, "jmax": 3, "mtu": 1280,
+    },
+    {
+        "id": "medium",
+        "name": "AWG-Medium",
+        "label_fa": "متوسط · تعادل",
+        "suitable": "فیلترینگ متوسط · موبایل / LTE",
+        "jc": 5, "jmin": 10, "jmax": 40, "mtu": 1280,
+    },
+    {
+        "id": "heavy",
+        "name": "AWG-Heavy",
+        "label_fa": "سنگین · عبور از فیلتر",
+        "suitable": "فیلترینگ شدید · شبکه محدود",
+        "jc": 12, "jmin": 40, "jmax": 80, "mtu": 1280,
+    },
+    {
+        "id": "ultra",
+        "name": "AWG-Ultra",
+        "label_fa": "خیلی سنگین",
+        "suitable": "شبکه خیلی محدود / DPI قوی",
+        "jc": 20, "jmin": 50, "jmax": 120, "mtu": 1200,
+    },
+    {
+        "id": "mobile",
+        "name": "AWG-Mobile",
+        "label_fa": "موبایل · MTU پایین",
+        "suitable": "۴G/۵G · پایداری بیشتر روی دیتا",
+        "jc": 5, "jmin": 10, "jmax": 40, "mtu": 1080,
+    },
+    {
+        "id": "wifi",
+        "name": "AWG-WiFi",
+        "label_fa": "وای‌فای · MTU بالاتر",
+        "suitable": "وای‌فای پایدار · دانلود بهتر",
+        "jc": 4, "jmin": 10, "jmax": 50, "mtu": 1420,
+    },
+)
+
+
+async def generate_amnezia_profile_batch(count: int = 6, sub_name: str = "AWG") -> list:
+    """Build up to `count` AmneziaWG WARP confs covering all profiles (no exception)."""
+    import random as _rnd
+    count = max(0, min(int(count or 0), len(AWG_PROFILES)))
+    if count <= 0:
+        return []
+    profiles = list(AWG_PROFILES[:count])
+    # if user wants fewer than all, still cycle unique profiles
+    out = []
+    for i, prof in enumerate(profiles):
+        try:
+            res = await fetch_warp_amnezia_conf(
+                mtu=int(prof["mtu"]),
+                jc=int(prof["jc"]),
+                jmin=int(prof["jmin"]),
+                jmax=int(prof["jmax"]),
+                label=f"{sub_name}-{prof['name']}",
+                amnezia=True,
+            )
+            if not res.get("ok"):
+                # one retry with different shuffle inside fetch
+                res = await fetch_warp_amnezia_conf(
+                    mtu=int(prof["mtu"]),
+                    jc=int(prof["jc"]),
+                    jmin=int(prof["jmin"]),
+                    jmax=int(prof["jmax"]),
+                    label=f"{sub_name}-{prof['name']}",
+                    amnezia=True,
+                )
+            if res.get("ok") and res.get("conf"):
+                out.append({
+                    "id": secrets.token_hex(4),
+                    "name": f"{prof['name']} · {prof['label_fa']}",
+                    "conf": res["conf"],
+                    "endpoint": res.get("endpoint") or "",
+                    "type": "amnezia",
+                    "profile": prof["id"],
+                    "suitable": prof["suitable"],
+                    "label_fa": prof["label_fa"],
+                    "jc": prof["jc"],
+                    "jmin": prof["jmin"],
+                    "jmax": prof["jmax"],
+                    "mtu": prof["mtu"],
+                })
+            else:
+                logger.warning("AWG profile %s failed: %s", prof["id"], res.get("error"))
+        except Exception as exc:
+            logger.warning("AWG profile %s error: %s", prof["id"], exc)
+    return out
+
+
+
 async def fetch_warp_amnezia_conf(
     endpoint: str | None = None,
     mtu: int = 1280,
@@ -3943,34 +4043,23 @@ async def create_multi_auto_link(request: Request, _=Depends(require_auth)):
         if eh != default_host or ep != DEFAULT_PORT or pub_sec != "tls":
             endpoints.append(("proxy", eh, ep, pub_sec))
 
-    # AmneziaWG via Cloudflare WARP (optional) — real working conf, not panel UDP
-    amnezia_count = safe_int(body.get("amnezia_count", 0), minimum=0, maximum=5)
+    # AmneziaWG via Cloudflare WARP — all junk profiles (light→ultra) without exception
+    # amnezia_count: 0=off, 1..6 = number of profiles (max = all 6)
+    amnezia_count = safe_int(body.get("amnezia_count", 0), minimum=0, maximum=6)
+    # if user asks for any AWG, generate full set of requested profile slots
+    if body.get("amnezia_all") in (True, 1, "1", "true", "yes"):
+        amnezia_count = len(AWG_PROFILES)
     amnezia_list = []
     if amnezia_count > 0:
-        for ai in range(amnezia_count):
-            try:
-                res = await fetch_warp_amnezia_conf(
-                    label=f"{sub_name}-AWG-{ai+1}",
-                    mtu=safe_int(body.get("amnezia_mtu", 1280), minimum=576, maximum=1500) or 1280,
-                    jc=safe_int(body.get("amnezia_jc", 4), minimum=1, maximum=128) or 4,
-                    jmin=safe_int(body.get("amnezia_jmin", 40), minimum=1, maximum=1279) or 40,
-                    jmax=safe_int(body.get("amnezia_jmax", 70), minimum=2, maximum=1280) or 70,
-                )
-                if res.get("ok") and res.get("conf"):
-                    amnezia_list.append({
-                        "id": secrets.token_hex(4),
-                        "name": res.get("name") or f"AWG-{ai+1}",
-                        "conf": res["conf"],
-                        "endpoint": res.get("endpoint") or "",
-                        "type": "amnezia",
-                    })
-            except Exception as exc:
-                logger.warning("amnezia generate failed: %s", exc)
+        amnezia_list = await generate_amnezia_profile_batch(amnezia_count, sub_name=sub_name)
         if amnezia_list:
             async with SUBS_LOCK:
                 if sub_id in SUBS:
                     SUBS[sub_id]["amnezia_configs"] = amnezia_list
                     sub["amnezia_configs"] = amnezia_list
+            logger.info("AWG batch: %s configs for sub %s", len(amnezia_list), sub_name)
+        else:
+            logger.warning("AWG batch empty for sub %s (WARP API failed?)", sub_name)
 
     # WireGuard protocol counts → real WARP WireGuard .conf (Cloudflare)
     wg_n = int(counts.pop("wireguard", 0) or 0)
@@ -6508,9 +6597,14 @@ img,canvas,svg{max-width:100%;height:auto}
       <a class="app" href="https://apps.apple.com/app/v2box-v2ray-client/id6446814690" target="_blank" rel="noopener"><div><div class="name">V2Box</div><div class="desc">آیفون · رایگان</div></div><span class="go">دانلود</span></a>
       <a class="app" href="https://apps.apple.com/app/shadowrocket/id932747118" target="_blank" rel="noopener"><div><div class="name">Shadowrocket</div><div class="desc">آیفون · پولی</div></div><span class="go">دانلود</span></a>
     </div>
-    <div id="awgBox" style="display:none;margin-top:18px">
-      <div class="sec-title">AmneziaWG</div>
-      <p style="font-size:12px;color:var(--t3);line-height:1.7;margin-bottom:10px">کانفیگ‌های AmneziaWG (WARP) — در اپ AmneziaVPN یا کلاینت AWG وارد کنید.</p>
+    <div class="sec-title" style="margin-top:16px">QR اشتراک</div>
+    <div style="display:flex;flex-direction:column;align-items:center;gap:10px;margin-bottom:16px;padding:14px;border-radius:16px;border:1px solid var(--border);background:rgba(0,0,0,.22)">
+      <canvas id="subQr" width="200" height="200" style="border-radius:12px;background:#fff;padding:8px;max-width:200px;width:100%;height:auto"></canvas>
+      <p style="font-size:11px;color:var(--t3);text-align:center;line-height:1.6">با اسکن این QR در v2rayNG / Hiddify / Streisand لینک ساب وارد می‌شود</p>
+    </div>
+    <div id="awgBox" style="display:none;margin-top:8px">
+      <div class="sec-title">AmneziaWG / WireGuard (WARP)</div>
+      <p style="font-size:12px;color:var(--t3);line-height:1.7;margin-bottom:10px">هر کانفیگ برای نوع شبکه مشخص است. در <b>AmneziaVPN</b> یا کلاینت WireGuard ایمپورت کنید.</p>
       <div id="awgList" style="display:flex;flex-direction:column;gap:8px"></div>
     </div>
     <div id="tgProxyBox" style="display:none;margin-top:18px">
@@ -6610,34 +6704,60 @@ function drawUsageChart(links){
     document.getElementById('barFill').style.width=(lim>0?pct:0)+'%';
     document.getElementById('barPct').textContent=lim>0?(pct.toFixed(1)+'% · '+fmtGB(used)+' / '+fmtGB(lim)):(fmtGB(used)+' / ∞');
     drawUsageChart(d.links||[]);
+    // QR for subscription URL
     try{
-      const ar=await fetch('/api/public/amnezia/'+key);
-      if(ar.ok){
-        const a=await ar.json();
-        const abox=document.getElementById('awgBox');
-        const alist=document.getElementById('awgList');
-        if(a&&a.ok&&a.configs&&a.configs.length&&abox&&alist){
-          abox.style.display='block';
-          alist.innerHTML=a.configs.map(function(c){
-            const name=c.name||(c.type==='wireguard'?'WireGuard':'AmneziaWG');
-            const conf=c.conf||'';
-            const eid=c.id||'';
-            return '<div class="app" style="flex-direction:column;align-items:stretch;gap:8px">'
-              +'<div style="display:flex;align-items:center;gap:10px"><div style="flex:1"><div class="name">'+name+'</div><div class="desc">AmneziaWG · '+((c.endpoint)||'')+'</div></div></div>'
-              +'<button type="button" class="btn btn-p awg-copy" style="width:100%" data-conf="'+encodeURIComponent(conf)+'">کپی کانفیگ</button>'
-              +'<a class="btn" style="text-align:center;text-decoration:none;background:rgba(255,255,255,.08);color:#e2e8f0;border:1px solid var(--border)" href="/api/public/amnezia/'+key+'/'+eid+'" download>دانلود .conf</a></div>';
-          }).join('');
-          alist.querySelectorAll('.awg-copy').forEach(function(btn){
-            btn.onclick=async function(){
-              try{
-                await navigator.clipboard.writeText(decodeURIComponent(btn.dataset.conf||''));
-                toast('کانفیگ AWG کپی شد');
-              }catch(e){toast('کپی نشد')}
-            };
-          });
-        }
+      const qr=document.getElementById('subQr');
+      if(qr){
+        const img=new Image();
+        img.crossOrigin='anonymous';
+        img.onload=function(){
+          const ctx=qr.getContext('2d');
+          ctx.fillStyle='#fff'; ctx.fillRect(0,0,200,200);
+          ctx.drawImage(img,0,0,200,200);
+        };
+        img.src='https://api.qrserver.com/v1/create-qr-code/?size=200x200&margin=10&data='+encodeURIComponent(subUrl);
       }
     }catch(e){}
+    function renderAwgList(configs){
+      const abox=document.getElementById('awgBox');
+      const alist=document.getElementById('awgList');
+      if(!(configs&&configs.length&&abox&&alist)) return;
+      abox.style.display='block';
+      alist.innerHTML=configs.map(function(c){
+        const name=c.name||(c.type==='wireguard'?'WireGuard':'AmneziaWG');
+        const conf=c.conf||'';
+        const eid=c.id||'';
+        const suit=c.suitable||'';
+        const meta=[c.label_fa, c.type==='wireguard'?'WireGuard':'AmneziaWG', c.mtu?('MTU '+c.mtu):''].filter(Boolean).join(' · ');
+        return '<div style="padding:14px;border-radius:16px;border:1px solid var(--border);background:rgba(0,0,0,.25);display:flex;flex-direction:column;gap:8px">'
+          +'<div class="name" style="font-weight:800">'+name+'</div>'
+          +(suit?'<div style="font-size:12px;color:#67e8f9;line-height:1.6">مناسب: '+suit+'</div>':'')
+          +'<div class="desc" style="font-size:11px;color:var(--t3)">'+meta+'</div>'
+          +'<div class="desc" style="font-size:10px;direction:ltr;color:var(--t3)">'+(c.endpoint||'')+'</div>'
+          +'<button type="button" class="btn btn-p awg-copy" style="width:100%" data-conf="'+encodeURIComponent(conf)+'">کپی کانفیگ</button>'
+          +'<a class="btn" style="text-align:center;text-decoration:none;background:rgba(255,255,255,.08);color:#e2e8f0;border:1px solid var(--border)" href="/api/public/amnezia/'+key+'/'+eid+'" download>دانلود .conf</a></div>';
+      }).join('');
+      alist.querySelectorAll('.awg-copy').forEach(function(btn){
+        btn.onclick=async function(){
+          try{
+            await navigator.clipboard.writeText(decodeURIComponent(btn.dataset.conf||''));
+            toast('کانفیگ کپی شد');
+          }catch(e){toast('کپی نشد')}
+        };
+      });
+    }
+    // from main meta (preferred) then API fallback
+    if(d.amnezia_configs&&d.amnezia_configs.length){
+      renderAwgList(d.amnezia_configs);
+    }else{
+      try{
+        const ar=await fetch('/api/public/amnezia/'+key);
+        if(ar.ok){
+          const a=await ar.json();
+          if(a&&a.configs) renderAwgList(a.configs);
+        }
+      }catch(e){}
+    }
     try{
       const mr=await fetch('/api/public/mtproto');
       if(mr.ok){
@@ -6935,6 +7055,24 @@ async def public_sub_data(
         except Exception:
             expiry_str = str(group_expiry)[:10]
 
+    awg_items = sub.get("amnezia_configs") or []
+    awg_public = [
+        {
+            "id": x.get("id"),
+            "name": x.get("name"),
+            "endpoint": x.get("endpoint"),
+            "conf": x.get("conf"),
+            "type": x.get("type") or "amnezia",
+            "suitable": x.get("suitable") or "",
+            "label_fa": x.get("label_fa") or "",
+            "profile": x.get("profile") or "",
+            "mtu": x.get("mtu"),
+            "jc": x.get("jc"),
+        }
+        for x in awg_items
+        if x.get("conf")
+    ]
+
     return {
         "locked": False,
         "name": sub["name"],
@@ -6950,6 +7088,8 @@ async def public_sub_data(
         "expiry": expiry_str,
         "support": SUPPORT_USERNAME,
         "links": links_out,
+        "amnezia_configs": awg_public,
+        "amnezia_count": len(awg_public),
     }
 
 
@@ -7960,7 +8100,21 @@ async def public_amnezia_list(uuid_key: str):
     return {
         "ok": True,
         "count": len(items),
-        "configs": [{"id": x.get("id"), "name": x.get("name"), "endpoint": x.get("endpoint"), "conf": x.get("conf")} for x in items],
+        "configs": [
+            {
+                "id": x.get("id"),
+                "name": x.get("name"),
+                "endpoint": x.get("endpoint"),
+                "conf": x.get("conf"),
+                "type": x.get("type") or "amnezia",
+                "suitable": x.get("suitable") or "",
+                "label_fa": x.get("label_fa") or "",
+                "profile": x.get("profile") or "",
+                "mtu": x.get("mtu"),
+                "jc": x.get("jc"),
+            }
+            for x in items
+        ],
     }
 
 
@@ -8979,8 +9133,8 @@ tr:hover td{background:var(--hover)}
       <div class="field"><label>نام ساب</label><input id="aSubName" placeholder="مثلاً کاربر-۱ یا VIP" maxlength="60">
     <div class="field" style="margin-top:10px">
       <label>تعداد AmneziaWG (WARP) — جدا از پروتکل‌ها</label>
-      <input id="aAmneziaCnt" type="number" min="0" max="5" value="0" style="direction:ltr;text-align:left">
-      <p style="font-size:11px;color:var(--t3);margin-top:6px;line-height:1.6">اگر بیشتر از ۰ باشد، کانفیگ واقعی AmneziaWG از WARP ساخته و داخل ساب قرار می‌گیرد (اپ AmneziaVPN).</p>
+      <input id="aAmneziaCnt" type="number" min="0" max="6" value="6" style="direction:ltr;text-align:left">
+      <p style="font-size:11px;color:var(--t3);margin-top:6px;line-height:1.6">۰ = خاموش · ۱ تا ۶ = تعداد پروفایل (سبک/متوسط/سنگین/…) · پیشنهادی: ۶ تا همه ساخته شوند. هر کانفیگ برچسب مناسب شبکه دارد.</p>
     </div></div>
       <div class="field"><label>پروتکل‌ها و تعداد</label>
         <div id="aProtoList" style="display:grid;grid-template-columns:1fr 1fr;gap:8px;max-height:220px;overflow:auto;padding:4px 0"></div>
@@ -9736,7 +9890,7 @@ async function doMultiAutoCreate(){
   if(!Object.keys(protocols).length){toast(lang==='fa'?'حداقل یک پروتکل انتخاب کنید':'Select at least one protocol');return}
   const body={
     sub_name:(document.getElementById('aSubName')?.value||'').trim()||undefined,
-    amnezia_count:Math.max(0,Math.min(5,Number(document.getElementById('aAmneziaCnt')?.value)||0)),
+    amnezia_count:Math.max(0,Math.min(6,Number(document.getElementById('aAmneziaCnt')?.value)||0)),amnezia_all:Number(document.getElementById('aAmneziaCnt')?.value)>=6,
     protocols,
     limit_value:Number(document.getElementById('aLimit')?.value)||0,
     limit_unit:document.getElementById('aUnit')?.value||'GB',
